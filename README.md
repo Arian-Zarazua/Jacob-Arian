@@ -12,6 +12,8 @@
 Run the script from the terminal command line using the commands below:
 
 ### Structure
+builds/
+| --- Build3.py
 
 reports/
 ├── data_profile.json
