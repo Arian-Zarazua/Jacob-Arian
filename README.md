@@ -43,7 +43,7 @@ test_modules.py
 
 3. Run:
    ```
-   python builds/build3_hitl_router_agent.py --data data/penguins.csv --report_dir reports --tags build3 --memory
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats/Stats-2023.csv --report_dir reports --tags build3 --memory
    ```
      - (optional) `--stream` tag
 
