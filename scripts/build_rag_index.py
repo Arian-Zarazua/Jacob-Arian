@@ -1,3 +1,8 @@
+'''
+run from project root:
+    python -m scripts.build_rag_index
+'''
+
 from __future__ import annotations
 
 import argparse

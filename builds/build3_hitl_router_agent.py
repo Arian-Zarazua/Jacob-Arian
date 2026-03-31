@@ -1,33 +1,10 @@
 """
 build3: HITL + Router (Tool Routing + Optional CodeGen/Execute)
 + Langfuse tracing (LangChain callbacks + observe decorator)
-
-THis build adds a top-level ROUTER that decides whether to:
-    (A) run one of the Build0 tools, OR
-    (B) fall back to CodeGen + optional Execute (subprocess).
-
-It adds a single main command:
-    ask <request>   (router decides tool vs codegen)
-
-Keeps power-user commands:
-    tool <request>  (force tool mode)
-    code <request>  (force codegen mode)
-    run             (execute last approved code)
-
-You will need the expected Build0 tool registry (tools.py in the updated src folder)
-
-Each tool function should accept (df, report_dir, **kwargs) and return either:
-- a string, OR
-- a dict with a "text" field (+ optional "artifact_paths"), OR
-- a tuple (text, artifact_paths)
-
-To run this script, you will need to make sure you have the most updated src and requirements.txt file
-from the course repository.
-
-Then, in the terminal or command line, run:
-  python builds/build3_hitl_router_agent.py --data data/penguins.csv --report_dir reports --tags build3 --memory
-
-  To stream LLM output, add the --stream flag to the command above
+RUN: (example for single CSV for stats of 2023 season)
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats/Stats-2023.csv --report_dir reports --tags build3 --memory
+    
+    (optional) --stream flag to the command above
 
 To interact with the agent, use the following commands:
     help                         Show this help text
