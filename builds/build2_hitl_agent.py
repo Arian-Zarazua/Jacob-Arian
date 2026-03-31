@@ -15,6 +15,8 @@ install the necessary libraries into your local project virtual environment.
 build1_llm_assistant_assignment_2.py file. The main areas you need to complete are:
 
 To run the script:
+python builds/build2_hitl_agent.py --data data/penguins.csv --report_dir reports --tags build2
+
   python builds/build2_hitl_agent.py --data data/penguins.csv --report_dir reports --tags build2
 """
 
