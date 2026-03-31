@@ -818,10 +818,9 @@ HELP_TEXT = """Commands:
   exit                         Quit
 
 Examples:
-  ask run a frequency table for sex
-  ask fit a regression of bill_length_mm on flipper_length_mm and sex
-  tool run a correlation heatmap for numeric columns
-  code create a plot of bill_length_mm by species and save it
+  How do passing statistics (completions, attempts, yards, touchdowns) correlate with a team's overall performance in terms of total yards and points scored?
+  What is the impact of rushing attempts and yards on a team's ability to convert on third and fourth downs?
+  Is there a relationship between the number of turnovers and a team's time of possession?
 """
 
 
