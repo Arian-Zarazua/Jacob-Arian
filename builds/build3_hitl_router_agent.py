@@ -1,10 +1,15 @@
 """
 build3: HITL + Router (Tool Routing + Optional CodeGen/Execute)
 + Langfuse tracing (LangChain callbacks + observe decorator)
-RUN: (example for single CSV for stats of 2023 season)
+RUN: (single CSV or an entire directory of CSVs)
+    # Single file (original behaviour)
     python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats/Stats-2023.csv --report_dir reports --tags build3 --memory
-    
-    (optional) --stream flag to the command above
+
+    # Entire stats directory — all *.csv files are loaded and concatenated
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+
+    (optional) --stream flag to either command above
+    (optional) --glob "*.csv" to override the file-matching pattern when --data is a directory
 
 To interact with the agent, use the following commands:
     help                         Show this help text
@@ -541,11 +546,27 @@ def build_codegen_chain(
         "- Produce ONE Python script that can run as a standalone file.\n"
         "- The script MUST:\n"
         "  (1) use argparse with --data and --report_dir\n"
-        "  (2) read the CSV at --data with pandas\n"
+        "  (2) load data with the helper below — --data may be a single CSV file OR\n"
+        "      a directory of CSV files; the helper handles both cases automatically.\n"
+        "      Always use this exact helper — never call pd.read_csv(args.data) directly:\n\n"
+        "      def load_data(data_path: str) -> pd.DataFrame:\n"
+        "          import pathlib, pandas as pd\n"
+        "          p = pathlib.Path(data_path)\n"
+        "          if p.is_file():\n"
+        "              return pd.read_csv(p)\n"
+        "          files = sorted(p.glob('*.csv'))\n"
+        "          if not files:\n"
+        "              raise FileNotFoundError('No CSVs found in ' + str(p))\n"
+        "          frames = []\n"
+        "          for f in files:\n"
+        "              part = pd.read_csv(f)\n"
+        "              part['_source_file'] = f.stem\n"
+        "              frames.append(part)\n"
+        "          return pd.concat(frames, ignore_index=True, sort=False)\n\n"
         "  (3) handle missing values explicitly\n"
         "  (4) If missing data are present, use listwise deletion unless specified otherwise\n"
-        "  (4) save at least ONE artifact into --report_dir\n"
-        "  (5) validate referenced columns exist (exit nonzero if not)\n\n"
+        "  (5) save at least ONE artifact into --report_dir\n"
+        "  (6) validate referenced columns exist (exit nonzero if not)\n\n"
         "OUTPUT FORMAT (exactly):\n"
         "PLAN:\n"
         "- ...\n\n"
@@ -818,9 +839,10 @@ HELP_TEXT = """Commands:
   exit                         Quit
 
 Examples:
-  How do passing statistics (completions, attempts, yards, touchdowns) correlate with a team's overall performance in terms of total yards and points scored?
-  What is the impact of rushing attempts and yards on a team's ability to convert on third and fourth downs?
-  Is there a relationship between the number of turnovers and a team's time of possession?
+  ask run a frequency table for sex
+  ask fit a regression of bill_length_mm on flipper_length_mm and sex
+  tool run a correlation heatmap for numeric columns
+  code create a plot of bill_length_mm by species and save it
 """
 
 
@@ -1257,13 +1279,64 @@ def do_router(
 
 
 # --------------------------------------------------------------------------------------
+# Data loading — single file OR directory of CSVs
+# --------------------------------------------------------------------------------------
+
+def load_data_path(data_path: Path, glob: str = "*.csv") -> pd.DataFrame:
+    """
+    Load a DataFrame from either:
+      - a single file  (CSV, Parquet, Excel — whatever read_data supports), or
+      - a directory    (all files matching *glob* are loaded and concatenated).
+
+    When loading a directory a ``_source_file`` column is added with the stem of
+    each filename (e.g. "Stats-2023") so downstream analysis can reference seasons
+    / splits.  Duplicate column names across files are handled by keeping the union
+    of all columns (missing values become NaN).
+    """
+    if data_path.is_file():
+        return read_data(data_path)
+
+    if not data_path.is_dir():
+        raise FileNotFoundError(f"--data path not found: {data_path}")
+
+    csv_files = sorted(data_path.glob(glob))
+    if not csv_files:
+        raise FileNotFoundError(
+            f"No files matching '{glob}' found in directory: {data_path}"
+        )
+
+    print(f"\n=== DIRECTORY MODE: found {len(csv_files)} file(s) ===")
+    frames: list[pd.DataFrame] = []
+    for f in csv_files:
+        print(f"  Loading: {f.name}")
+        part = read_data(f)
+        part["_source_file"] = f.stem   # e.g. "Stats-2023"
+        frames.append(part)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    print(f"  Combined shape: {combined.shape}\n")
+    return combined
+
+
+# --------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="build3: HITL + Router (Tool Routing + Optional CodeGen/Execute) + Langfuse"
     )
-    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help="Path to a single CSV file OR a directory of CSV files to concatenate.",
+    )
+    parser.add_argument(
+        "--glob",
+        type=str,
+        default="*.csv",
+        help="Glob pattern for matching files when --data is a directory (default: '*.csv').",
+    )
     parser.add_argument("--report_dir", type=str, default="reports")
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.2)
@@ -1284,8 +1357,8 @@ def main() -> None:
     ensure_dirs(report_dir)
     ensure_dirs(report_dir / "tool_outputs")
 
-    # Load data + schema
-    df = read_data(data_path)
+    # Load data + schema — supports single file OR directory of CSVs
+    df = load_data_path(data_path, glob=args.glob)
     df_columns = set(df.columns)
     schema_text = profile_to_schema_text(basic_profile(df))
 

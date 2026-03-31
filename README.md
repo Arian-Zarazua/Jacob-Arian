@@ -42,10 +42,18 @@ test_modules.py
    ```
 
 3. Run:
-   ```
+4.   # Single file (original behaviour)
+    ``` python
     python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats/Stats-2023.csv --report_dir reports --tags build3 --memory
-   ```
-     - (optional) `--stream` tag
+    ```
+    ```python
+    # Entire stats directory — all *.csv files are loaded and concatenated
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+    ```
+    (optional) --stream flag to either command above
+    (optional) --glob "*.csv" to override the file-matching pattern when --data is a directory
+
+  
 
 
 
