@@ -82,6 +82,7 @@ def plot_histograms(
     fig_dir = Path(fig_dir)
     fig_dir.mkdir(parents=True, exist_ok=True)
 
+
     written: List[str] = []
     for c in numeric_cols[:max_cols]:
         if c not in df.columns:
@@ -109,6 +110,7 @@ def plot_bar_charts(
     # Back-compat args
     cat_cols: Optional[List[str]] = None,
     column: Optional[str] = None,
+    cat_col: Optional[str] = None,  # added for robustness
     # Output control
     fig_dir: Optional[Union[str, Path]] = None,
     max_cols: int = 12,
@@ -120,6 +122,7 @@ def plot_bar_charts(
       - x="species"            (router style)
       - column="species"       (older style)
       - cat_cols=["species","island"]
+      - cat_col="species"      (fallback for bad router output)
 
     'y' is accepted for compatibility with (x, y) tool suggestions, but is not used.
     Returns artifact_paths + text (agent-friendly); safe for callers that ignore returns.
@@ -128,6 +131,10 @@ def plot_bar_charts(
         fig_dir = Path("figures")
     fig_dir = Path(fig_dir)
     fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # Normalize bad router arg
+    if cat_col is not None:
+        x = cat_col
 
     provided = [arg is not None for arg in (cat_cols, column, x)]
     if sum(provided) > 1:
@@ -161,28 +168,43 @@ def plot_bar_charts(
         "artifact_paths": written,
     }
 
-
 def plot_cat_num_boxplot(
     df: pd.DataFrame,
-    categorical_column: str,
-    numerical_column: str,
+    categorical_column: Optional[str] = None,
+    numerical_column: Optional[str] = None,
     # Backward compatible output controls:
     out_path: Optional[Union[str, Path]] = None,
     fig_dir: Optional[Union[str, Path]] = None,
     out_dir: Optional[Union[str, Path]] = None,
     missing: str = "drop",
+    **kwargs,
 ) -> Dict[str, Any]:
-    """Boxplot of a numeric column grouped by a categorical column.
+    """Boxplot of a numeric column grouped by a categorical column."""
 
-    Backward compatible:
-      - older callers may pass out_path
-      - Build2 runner tends to inject fig_dir
-      - some routers may prefer out_dir
+    # --- Normalize bad router argument names ---
+    if categorical_column is None:
+        if "x" in kwargs:
+            categorical_column = str(kwargs["x"])
+        elif "x_col" in kwargs:
+            categorical_column = str(kwargs["x_col"])
+        elif "categorical_col" in kwargs:
+            categorical_column = str(kwargs["categorical_col"])
+        elif "cat_col" in kwargs:
+            categorical_column = str(kwargs["cat_col"])
 
-    Missing-data policy:
-      - drop (default): drop rows missing either variable
-      - raise: error if any missing
-    """
+    if numerical_column is None:
+        if "y" in kwargs:
+            numerical_column = str(kwargs["y"])
+        elif "y_col" in kwargs:
+            numerical_column = str(kwargs["y_col"])
+        elif "numerical_col" in kwargs:
+            numerical_column = str(kwargs["numerical_col"])
+        elif "num_col" in kwargs:
+            numerical_column = str(kwargs["num_col"])
+
+    if categorical_column is None or numerical_column is None:
+        raise ValueError("Both categorical and numerical columns must be provided.")
+
     cat_col = categorical_column
     num_col = numerical_column
 
@@ -191,7 +213,7 @@ def plot_cat_num_boxplot(
     if num_col not in df.columns:
         raise ValueError(f"Column not found: {num_col}")
 
-    # Resolve output directory / path
+    # --- Resolve output path ---
     if out_path is not None:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,7 +230,9 @@ def plot_cat_num_boxplot(
         sub = sub.dropna(subset=[cat_col, num_col])
     elif missing == "raise":
         if sub[[cat_col, num_col]].isna().any().any():
-            raise ValueError(f"Missing values found in '{cat_col}' and/or '{num_col}'.")
+            raise ValueError(
+                f"Missing values found in '{cat_col}' and/or '{num_col}'."
+            )
     else:
         raise ValueError(f"Unknown missing policy: {missing}")
 

@@ -932,30 +932,40 @@ def traced_run_tool(
         params = {}
         accepts_kwargs = True  # safest fallback
 
-    # --- Inject dirs into tool_args if the tool supports them and they're missing ---
-    # Your plotting tools in src/plotting.py typically take fig_dir; keep this flexible.
+    # --- Inject dirs into tool_args if supported ---
     dir_defaults = {
-        # figures
         "fig_dir": tool_figure_dir,
         "plot_dir": tool_figure_dir,
         "plots_dir": tool_figure_dir,
         "figure_dir": tool_figure_dir,
         "figures_dir": tool_figure_dir,
-        # outputs
         "out_dir": tool_output_dir,
         "output_dir": tool_output_dir,
         "artifact_dir": tool_output_dir,
-        # NOTE: we still pass report_dir separately below for tools that support it
     }
 
     for k, default_path in dir_defaults.items():
         if k not in tool_args and (k in params or accepts_kwargs):
             tool_args[k] = default_path
 
-    # Normalize string paths → Path objects (helps if router emitted strings)
+    # Normalize string paths → Path
     for k in list(tool_args.keys()):
         if k in dir_defaults and isinstance(tool_args[k], str):
             tool_args[k] = Path(tool_args[k])
+
+    # --- FIX: Normalize bad router argument names BEFORE tracing ---
+    if "cat_col" in tool_args:
+        tool_args["x"] = tool_args.pop("cat_col")
+
+    if "categorical_col" in tool_args:
+        tool_args["x"] = tool_args.pop("categorical_col")
+
+    if "x_col" in tool_args:
+        tool_args["x"] = tool_args.pop("x_col")
+
+    # Drop unsupported args
+    tool_args.pop("y_col", None)
+    tool_args.pop("agg_func", None)
 
     # --- Trace + execute ---
     with propagate_attributes(
@@ -965,7 +975,6 @@ def traced_run_tool(
             "args": json.dumps(tool_args, ensure_ascii=False, default=str),
         },
     ):
-        # Preserve your existing "report_dir if supported" behavior
         supports_report_dir = ("report_dir" in params) or accepts_kwargs
 
         if supports_report_dir:
@@ -980,8 +989,6 @@ def traced_run_tool(
         print()
 
         return normalize_tool_return(tool_name, result)
-
-
 # --------------------------------------------------------------------------------------
 # Core routines (HITL)
 # --------------------------------------------------------------------------------------
