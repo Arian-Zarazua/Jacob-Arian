@@ -6,6 +6,8 @@ RUN: (example for single CSV for stats of 2023 season)
     
     (optional) --stream flag to the command above
 
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats/Stats-2023.csv --report_dir reports --tags build3 --memory
+    
 To interact with the agent, use the following commands:
     help                         Show this help text
     schema                       Print dataset schema
