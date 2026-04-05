@@ -46,7 +46,12 @@ def read_data(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"CSV not found: {path}")
 
-    df = pd.read_csv(path)
+    try:
+        # Use on_bad_lines for pandas >=1.3.0
+        df = pd.read_csv(path, on_bad_lines='warn')
+    except TypeError:
+        # Fallback for older pandas
+        df = pd.read_csv(path, error_bad_lines=False, warn_bad_lines=True)
 
     if df.empty:
         raise ValueError("Loaded dataframe is empty.")

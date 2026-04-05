@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Union, Dict, Any
+from typing import List, Optional, Union, Any
 
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# output formatting helper
+from src.utils.tool_result_utils import ToolResult, make_tool_result
 
-def plot_missingness(miss_df: pd.DataFrame, out_path: Path, top_n: int = 30) -> None:
+
+def plot_missingness(
+    miss_df: pd.DataFrame,
+    out_path: Union[str, Path],
+    top_n: int = 30,
+) -> ToolResult:
     """Plot missing data in a horizontal bar chart."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -21,49 +28,149 @@ def plot_missingness(miss_df: pd.DataFrame, out_path: Path, top_n: int = 30) -> 
     plt.savefig(out_path, dpi=200)
     plt.close()
 
+    summary_text = f"Saved missingness plot for top {min(top_n, len(miss_df))} column(s) to {out_path}."
+
+    out = {
+        "n_columns_plotted": int(min(top_n, len(miss_df))),
+        "artifact_paths": [str(out_path)],
+    }
+
+    return make_tool_result(
+        name="plot_missingness",
+        text=summary_text,
+        artifact_paths=[str(out_path)],
+        structured=out,
+    )
+
 
 def plot_corr_heatmap(
-    corr: pd.DataFrame,
-    out_path: Path,
+    df: pd.DataFrame,
+    numeric_cols: Optional[list[str]] = None,
+    out_path: Optional[str | Path] = None,
+    report_dir: Optional[str | Path] = None,
     missing: str = "drop",
-) -> None:
-    """Create a heatmap of correlations for numeric columns."""
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+) -> ToolResult:
+    """
+    Create a correlation heatmap for numeric columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Full input dataframe.
+    numeric_cols : list[str] | None
+        Specific numeric columns to include. If None, all numeric columns are used.
+    out_path : str | Path | None
+        Optional filename or full path for the saved figure.
+    report_dir : str | Path | None
+        Optional output directory used when out_path is relative or omitted.
+    missing : str
+        How to handle missing data before computing correlations.
+        Supported:
+        - "drop": drop rows with missing data in selected numeric columns
+        - "pairwise": let pandas compute pairwise correlations
+
+    Returns
+    -------
+    ToolResult:
+        with:
+        - "text": summary message
+        - "artifact_paths": list of saved file paths
+    """
+    # If numeric_cols not provided, use all numeric columns
+    if numeric_cols is None:
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    # Basic validation
+    if not numeric_cols:
+        return make_tool_result(
+            name="plot_corr_heatmap",
+            text="No numeric columns were available for a correlation heatmap.",
+            artifact_paths=[],
+            structured={},
+        )
+
+    missing_cols = [col for col in numeric_cols if col not in df.columns]
+    if missing_cols:
+        return make_tool_result(
+            name="plot_corr_heatmap",
+            text=f"These requested columns were not found in the dataframe: {missing_cols}",
+            artifact_paths=[],
+            structured={},
+        )
+
+    # Keep only numeric columns requested
+    work_df = df[numeric_cols].copy()
+
+    # Missing-data handling
+    if missing == "drop":
+        work_df = work_df.dropna()
+        corr = work_df.corr(numeric_only=True)
+    elif missing == "pairwise":
+        corr = work_df.corr(numeric_only=True)
+    else:
+        return make_tool_result(
+            name="plot_corr_heatmap",
+            text=f"Unsupported missing option: {missing}. Use 'drop' or 'pairwise'.",
+            artifact_paths=[],
+            structured={},
+        )
 
     if corr.empty:
-        return
+        return make_tool_result(
+            name="plot_corr_heatmap",
+            text="Correlation matrix was empty after filtering/handling missing data.",
+            artifact_paths=[],
+            structured={},
+        )
 
-    if corr.shape[0] > 20:
-        print("Too many variables to annotate heatmap clearly.")
+    # Resolve output path
+    if out_path is None:
+        if report_dir is not None:
+            out_path = Path(report_dir) / "correlation_heatmap.png"
+        else:
+            out_path = Path("correlation_heatmap.png")
+    else:
+        out_path = Path(out_path)
+        if not out_path.is_absolute() and report_dir is not None:
+            out_path = Path(report_dir) / out_path
 
-        plt.figure()
-        im = plt.imshow(corr.values, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
-        plt.colorbar(im)
-        plt.xticks(range(len(corr.columns)), corr.columns, rotation=90, fontsize=7)
-        plt.yticks(range(len(corr.index)), corr.index, fontsize=7)
-        plt.title("Correlation heatmap (numeric columns)")
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=200)
-        plt.close()
-        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    plt.figure()
+    # Plot
+    plt.figure(figsize=(8, 6))
     im = plt.imshow(corr.values, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
     plt.colorbar(im)
 
-    plt.xticks(range(len(corr.columns)), corr.columns, rotation=90, fontsize=7)
-    plt.yticks(range(len(corr.index)), corr.index, fontsize=7)
+    x_labels = corr.columns.tolist()
+    y_labels = corr.index.tolist()
+    plt.xticks(range(len(x_labels)), x_labels, rotation=90, fontsize=7)
+    plt.yticks(range(len(y_labels)), y_labels, fontsize=7)
 
-    for i in range(len(corr.index)):
-        for j in range(len(corr.columns)):
-            value = corr.iloc[i, j]
-            plt.text(j, i, f"{value:.2f}", ha="center", va="center", fontsize=6)
+    # Add cell labels only when number of variables is manageable
+    if corr.shape[0] <= 20:
+        for i in range(len(corr.index)):
+            for j in range(len(corr.columns)):
+                value = corr.iloc[i, j]
+                plt.text(j, i, f"{value:.2f}", ha="center", va="center", fontsize=6)
 
     plt.title("Correlation heatmap (numeric columns)")
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
     plt.close()
+
+    return make_tool_result(
+        name="plot_corr_heatmap",
+        text=(
+            f"Saved correlation heatmap for {len(numeric_cols)} numeric column(s): "
+            f"{', '.join(numeric_cols)}"
+        ),
+        artifact_paths=[str(out_path)],
+        structured={
+            "numeric_columns": numeric_cols,
+            "n_numeric_columns": len(numeric_cols),
+            "artifact_paths": [str(out_path)],
+        },
+    )
 
 
 def plot_histograms(
@@ -71,7 +178,7 @@ def plot_histograms(
     numeric_cols: List[str],
     fig_dir: Union[str, Path],
     max_cols: int = 12,
-) -> Dict[str, Any]:
+) -> ToolResult:
     """Save histograms for up to max_cols numeric columns.
 
     Backward compatible:
@@ -81,7 +188,6 @@ def plot_histograms(
     """
     fig_dir = Path(fig_dir)
     fig_dir.mkdir(parents=True, exist_ok=True)
-
 
     written: List[str] = []
     for c in numeric_cols[:max_cols]:
@@ -96,10 +202,16 @@ def plot_histograms(
         plt.close()
         written.append(str(out_path))
 
-    return {
-        "text": f"Saved {len(written)} histogram(s) to {fig_dir}",
-        "artifact_paths": written,
-    }
+    return make_tool_result(
+        name="plot_histograms",
+        text=f"Saved {len(written)} histogram(s) to {fig_dir}",
+        artifact_paths=written,
+        structured={
+            "numeric_columns_requested": numeric_cols,
+            "n_histograms_saved": len(written),
+            "artifact_paths": written,
+        },
+    )
 
 
 def plot_bar_charts(
@@ -110,19 +222,17 @@ def plot_bar_charts(
     # Back-compat args
     cat_cols: Optional[List[str]] = None,
     column: Optional[str] = None,
-    cat_col: Optional[str] = None,  # added for robustness
     # Output control
     fig_dir: Optional[Union[str, Path]] = None,
     max_cols: int = 12,
     top_k: int = 20,
-) -> Dict[str, Any]:
+) -> ToolResult:
     """Save bar charts of category COUNTS for categorical columns (top_k categories).
 
     Accepts any ONE of:
       - x="species"            (router style)
       - column="species"       (older style)
       - cat_cols=["species","island"]
-      - cat_col="species"      (fallback for bad router output)
 
     'y' is accepted for compatibility with (x, y) tool suggestions, but is not used.
     Returns artifact_paths + text (agent-friendly); safe for callers that ignore returns.
@@ -131,10 +241,6 @@ def plot_bar_charts(
         fig_dir = Path("figures")
     fig_dir = Path(fig_dir)
     fig_dir.mkdir(parents=True, exist_ok=True)
-
-    # Normalize bad router arg
-    if cat_col is not None:
-        x = cat_col
 
     provided = [arg is not None for arg in (cat_cols, column, x)]
     if sum(provided) > 1:
@@ -163,48 +269,40 @@ def plot_bar_charts(
         plt.close()
         written.append(str(out_path))
 
-    return {
-        "text": f"Saved {len(written)} bar chart(s) (counts) to {fig_dir}",
-        "artifact_paths": written,
-    }
+    return make_tool_result(
+        name="plot_bar_charts",
+        text=f"Saved {len(written)} bar chart(s) (counts) to {fig_dir}",
+        artifact_paths=written,
+        structured={
+            "categorical_columns_plotted": cat_cols[:max_cols],
+            "top_k": top_k,
+            "n_bar_charts_saved": len(written),
+            "artifact_paths": written,
+        },
+    )
+
 
 def plot_cat_num_boxplot(
     df: pd.DataFrame,
-    categorical_column: Optional[str] = None,
-    numerical_column: Optional[str] = None,
+    categorical_column: str,
+    numerical_column: str,
     # Backward compatible output controls:
     out_path: Optional[Union[str, Path]] = None,
     fig_dir: Optional[Union[str, Path]] = None,
     out_dir: Optional[Union[str, Path]] = None,
     missing: str = "drop",
-    **kwargs,
-) -> Dict[str, Any]:
-    """Boxplot of a numeric column grouped by a categorical column."""
+) -> ToolResult:
+    """Boxplot of a numeric column grouped by a categorical column.
 
-    # --- Normalize bad router argument names ---
-    if categorical_column is None:
-        if "x" in kwargs:
-            categorical_column = str(kwargs["x"])
-        elif "x_col" in kwargs:
-            categorical_column = str(kwargs["x_col"])
-        elif "categorical_col" in kwargs:
-            categorical_column = str(kwargs["categorical_col"])
-        elif "cat_col" in kwargs:
-            categorical_column = str(kwargs["cat_col"])
+    Backward compatible:
+      - older callers may pass out_path
+      - Build2 runner tends to inject fig_dir
+      - some routers may prefer out_dir
 
-    if numerical_column is None:
-        if "y" in kwargs:
-            numerical_column = str(kwargs["y"])
-        elif "y_col" in kwargs:
-            numerical_column = str(kwargs["y_col"])
-        elif "numerical_col" in kwargs:
-            numerical_column = str(kwargs["numerical_col"])
-        elif "num_col" in kwargs:
-            numerical_column = str(kwargs["num_col"])
-
-    if categorical_column is None or numerical_column is None:
-        raise ValueError("Both categorical and numerical columns must be provided.")
-
+    Missing-data policy:
+      - drop (default): drop rows missing either variable
+      - raise: error if any missing
+    """
     cat_col = categorical_column
     num_col = numerical_column
 
@@ -213,7 +311,7 @@ def plot_cat_num_boxplot(
     if num_col not in df.columns:
         raise ValueError(f"Column not found: {num_col}")
 
-    # --- Resolve output path ---
+    # Resolve output directory / path
     if out_path is not None:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,9 +328,7 @@ def plot_cat_num_boxplot(
         sub = sub.dropna(subset=[cat_col, num_col])
     elif missing == "raise":
         if sub[[cat_col, num_col]].isna().any().any():
-            raise ValueError(
-                f"Missing values found in '{cat_col}' and/or '{num_col}'."
-            )
+            raise ValueError(f"Missing values found in '{cat_col}' and/or '{num_col}'.")
     else:
         raise ValueError(f"Unknown missing policy: {missing}")
 
@@ -244,6 +340,10 @@ def plot_cat_num_boxplot(
 
     sub[num_col] = pd.to_numeric(sub[num_col], errors="coerce")
     sub = sub.dropna(subset=[num_col])
+    n_after_missing = n_after
+    n_after_coercion = len(sub)
+    dropped_after_coercion = n_after_missing - n_after_coercion
+
     if sub.empty:
         raise ValueError("Numeric column could not be coerced to numeric.")
 
@@ -268,7 +368,25 @@ def plot_cat_num_boxplot(
     plt.savefig(out_path, dpi=200)
     plt.close()
 
-    return {
-        "text": f"Saved boxplot to {out_path}. Dropped {dropped} row(s) due to missing values (policy='{missing}').",
-        "artifact_paths": [str(out_path)],
-    }
+    return make_tool_result(
+        name="plot_cat_num_boxplot",
+        text=(
+            f"Saved boxplot to {out_path}. "
+            f"Dropped {dropped} row(s) due to missing values "
+            f"(policy='{missing}') and {dropped_after_coercion} row(s) "
+            f"during numeric coercion."
+        ),
+        artifact_paths=[str(out_path)],
+        structured={
+            "categorical_column": cat_col,
+            "numerical_column": num_col,
+            "missing_policy": missing,
+            "n_rows_before": n_before,
+            "n_rows_after_missing_filter": n_after,
+            "n_rows_after_numeric_coercion": n_after_coercion,
+            "n_dropped_missing": dropped,
+            "n_dropped_numeric_coercion": dropped_after_coercion,
+            "n_groups_plotted": len(groups),
+            "artifact_paths": [str(out_path)],
+        },
+    )
