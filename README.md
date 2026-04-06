@@ -1,164 +1,161 @@
 # Assignment 3: Build 3 – HITL + Tool Router Agent with Time Series Support
 
-**Course**: QAC387  
-**Students**: Jacob Poore and Arian Zarazua  
+| | |
+|---|---|
+| **Course** | QAC387 |
+| **Students** | Jacob Poore and Arian Zarazua |
+| **📋 Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log.pdf) |
+
+---
 
 
-## Overview
+## Installation
 
-This project implements a Human-in-the-Loop (HITL) AI Data Analysis Agent using an LLM-based router with enhanced time series analysis capabilities.
-
-The agent:
-- Accepts natural language data questions
-- Intelligently routes tasks to specialized tools or generates Python code
-- Prioritizes temporal trend analysis when time-based columns are available
-- Requires human approval before executing generated code
-- Returns results with explanations and visualizations
-- Optionally logs activity using Langfuse
-
-**Assignment 3 Additions**
--  **Time Series Tools**: Temporal aggregation and line chart visualization
--  **Enhanced Router**: Improved system prompts for temporal analysis detection
-- **Better Suggestions**: LLM now recommends time-series analyses first when temporal columns exist
-
-## How to Run 
-
-1. Install dependencies from root:
-   
-   `pip install -r requirements.txt `
-
-2. Set API keys:
-   ```
-   OPENAI_API_KEY=your_key  
-   LANGFUSE_PUBLIC_KEY=your_key 
-   LANGFUSE_SECRET_KEY=your_key  
-   LANGFUSE_BASE_URL = "http://localhost:(open localport, e.g. '3000')"
-   ```
-
-3. Run the agent:
-   
-   **Single CSV file:**
-   ```bash
-   python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats/2023_NFL_Team_Statistics.csv --report_dir reports --tags build3 --memory
-   ```
-
-   **Directory of CSV files (batch processing):**
-   ```bash
-   python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
-   ```
-
-   **Optional flags:**
-   - `--stream`: Enable streaming output from LLM
-   - `--memory`: Enable multi-turn conversation memory
-   - `--tags build3`: Tag all traces with "build3" (for Langfuse logging)
-
-
-## Agent Commands
-
-Once the agent starts, you can interact with it using:
-
-```
-help                  Show available commands
-schema                Display dataset schema (columns + dtypes)
-suggest <question>    Get AI suggestions for analyses (prioritizes temporal trends)
-ask <request>         Router decides: tool execution OR code generation (HITL)
-tool <request>        Force tool execution: router selects best tool
-code <request>        Force code generation (HITL): review before approving
-run                   Execute last approved/generated script
-exit                  Quit the agent
+Install dependencies from the root directory:
+```bash
+pip install -r requirements.txt
 ```
 
+### Configuration
 
-## Example Usage
-
-### Time Series Analysis
+Set the required API keys:
+```bash
+export OPENAI_API_KEY=your_key
+export LANGFUSE_PUBLIC_KEY=your_key
+export LANGFUSE_SECRET_KEY=your_key
+export LANGFUSE_BASE_URL=http://localhost:3000  # or your port
 ```
+
+On Windows (PowerShell):
+```powershell
+$env:OPENAI_API_KEY="your_key"
+$env:LANGFUSE_PUBLIC_KEY="your_key"
+$env:LANGFUSE_SECRET_KEY="your_key"
+$env:LANGFUSE_BASE_URL="http://localhost:3000"
+```
+
+### Running the Agent
+
+**Single file analysis:**
+```bash
+python builds/build3_hitl_router_agent.py \
+  --data data/Pro-Football-Reference/Stats/Stats-2023.csv \
+  --report_dir reports \
+  --tags build3 \
+  --memory
+```
+
+**Batch processing (directory of CSVs):**
+```bash
+python builds/build3_hitl_router_agent.py \
+  --data data/Pro-Football-Reference/Stats \
+  --report_dir reports \
+  --tags build3 \
+  --memory
+```
+
+**Optional flags:**
+| Flag | Description |
+|------|-------------|
+| `--stream` | Enable streaming output from LLM |
+| `--memory` | Enable multi-turn conversation memory |
+| `--tags build3` | Tag all traces (useful for Langfuse logging) |
+
+---
+
+## 💬 Agent Commands
+
+| Command | Description |
+|---------|-------------|
+| `help` | Show available commands |
+| `schema` | Display dataset schema (columns + data types) |
+| `suggest <question>` | Get AI suggestions for analyses (prioritizes temporal trends) |
+| `ask <request>` | Router decides: tool execution OR code generation (HITL) |
+| `tool <request>` | Force tool execution: router selects best applicable tool |
+| `code <request>` | Force code generation (HITL): review before approving |
+| `run` | Execute last approved/generated script |
+| `exit` | Quit the agent |
+
+---
+
+## Example Use Cases
+
+**Time Series Analysis:**
+```bash
 ask plot average passing yards by season
+ask show quarterback performance trends across years
 ```
 
-## Cautions & Limitations
+---
 
- **Code Generation Risks:**
-- Generated code may be incorrect or unintended; review manually before executing
+##  Important Cautions & Limitations
+
+###  Code Generation Risks
+- Generated code may be incorrect or unintended—**always review manually before executing**
 - LLM outputs are probabilistic and can contain logical errors
-- Always read and approve code before running
+- Approve reviewed code before running
 
- **Tool Limitations:**
-- Some Build0 tools work best with single CSV files (batch mode may use codegen instead)
-- Large datasets may reduce performance (SQL integration planned for future builds)
-- Tool arguments are validated against schema but edge cases may occur (currently PBP data has issues with dates/seasons)
+###  Tool Limitations
+- Some Build0 tools work best with **single CSV files** (batch mode may use code gen instead)
+- Large datasets may reduce performance (SQL integration planned for v2)
+- Tool arguments are validated against schema, but edge cases may occur
 
- **Time Series Features:**
-- Temporal analysis is prioritized when time-based columns are detected
-- Supported temporal columns: season, year, month, game_id, week, date, etc.
+###  Time Series Features
+- Temporal analysis is prioritized when time-based columns detected
 - Aggregation handles NULL values gracefully (drops before aggregation) 
 
 
-## Project Context: NFL Data AI Agent
+##  Architecture
 
-This assignment is a core component of our larger project:
+### Intelligent Routing
+The LLM router evaluates user requests and decides between:
+- **Tool Execution** → Dispatches to specialized tools (faster, deterministic)
+- **Code Generation** → Creates custom Python scripts (flexible, custom logic)
 
-"Using AI Agents to Analyze NFL Data"
+### Human-In-The-Loop (HITL)
+- Users review and approve generated code before execution
+- Optional Langfuse logging for activity tracing
 
-Goal:
-Allow users to query a decade of NFL using plain English. 
-
-Example:
-"Who was the best quarterback of the 2010s?"
-
-
-
-## LLM Router Agent
-   - **Intelligent Routing**: Evaluates user requests and decides between:
-     - **Tool Execution**: Dispatches to specialized tools (faster, deterministic)
-     - **Code Generation**: Creates custom Python scripts for complex analyses (flexible)
-   - **Enhanced System Prompts**: 
-     - Router detects temporal columns and prioritizes time-series tools
-     - Tool plan generator includes parameter validation
-     - Suggestion engine recommends temporal analyses when appropriate
-   - **HITL (Human-In-The-Loop)**:
-     - Users review and approve generated code before execution
-     - Command-based interface for easy interaction and control
+---
 
 
-## Additional Test Runs
+##  Test Datasets
 
-**Pro-Football-Reference Datasets:**
+### Pro-Football-Reference Data
 ```bash
 # Team statistics across multiple seasons
-python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+python builds/build3_hitl_router_agent.py \
+  --data data/Pro-Football-Reference/Stats \
+  --report_dir reports --tags build3 --memory
 
 # Metadata and contextual information
-python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Metadata --report_dir reports --tags build3 --memory
+python builds/build3_hitl_router_agent.py \
+  --data data/Pro-Football-Reference/Metadata \
+  --report_dir reports --tags build3 --memory
 ```
 
-**NFL Savant Play-by-Play Data:**
+### NFL Stat-Savant Play-by-Play Data
 ```bash
-# Granular game-level play information (test temporal analysis with game_id or week)
-python builds/build3_hitl_router_agent.py --data data/Stat-Savant/PBP --report_dir reports --tags build3 --memory
+# Granular game-level play information
+python builds/build3_hitl_router_agent.py \
+  --data data/Stat-Savant/PBP \
+  --report_dir reports --tags build3 --memory
 ```
 
+---
 
-## Known Issues & Limitations
+##  Known Issues & Future Work
 
 ### Current Challenges
-1. **Tool Misselection**: Agent occasionally selects incorrect tools or misroutes column types
-   - Partially mitigated by enhanced prompts and column type validation
-   
-2. **Data Quality Issues**:
-   - Stat-Savant PBP data contains malformed CSV rows (partially handled by io_utils.py)
-   - Missing season information in some date fields requires manual augmentation
-   - Filtering by specific year/season can produce inconsistent results
+| Issue | Status | Notes |
+|-------|--------|-------|
+| **Tool Misselection** | Mitigated | Enhanced prompts reduce incorrect routing |
+| **Stat-Savant PBP Quality** | Ongoing | Malformed CSV rows; handled by `io_utils.py` |
+| **Temporal Column Naming** | Planned | Standardization needed across datasets |
+| **Code Generation Accuracy** | Ongoing | Requires manual review before execution |
 
-3. **Build0 Tool Compatibility**:
-   - Some existing Build0 tools may not work correctly with batch (directory) input
-   - Single CSV files are more reliable for specialized tools
-   - Workaround: Use code generation for complex multi-file analyses
-
-4. **Code Generation Limitations**:
-   - OpenAI sometimes generates time-series code that doesn't match user intent
-   - Generated code requires manual review and validation
-
-### Future Fixes Planned
+### Planned Improvements
 - [ ] Standardize temporal column naming across datasets
 - [ ] Enhance tool-specific prompt engineering for improved column routing
+- [ ] SQL integration for large dataset processing
+- [ ] Better date/season field validation
