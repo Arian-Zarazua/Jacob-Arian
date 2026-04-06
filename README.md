@@ -5,7 +5,9 @@
 | **Course** | QAC387 |
 | **Students** | Jacob Poore and Arian Zarazua |
 | ** Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log.pdf) |
-
+> [!WARNING]
+> **IMPORTANT:** Do NOT commit or upload Langfuse logs.  
+> These files may contain OpenAI API keys and will be blocked by GitHub push protection.
 ---
 
 
