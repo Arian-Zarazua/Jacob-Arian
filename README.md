@@ -28,13 +28,6 @@ export LANGFUSE_SECRET_KEY=your_key
 export LANGFUSE_BASE_URL=http://localhost:3000  # or your port
 ```
 
-On Windows (PowerShell):
-```powershell
-$env:OPENAI_API_KEY="your_key"
-$env:LANGFUSE_PUBLIC_KEY="your_key"
-$env:LANGFUSE_SECRET_KEY="your_key"
-$env:LANGFUSE_BASE_URL="http://localhost:3000"
-```
 
 ### Running the Agent
 
@@ -61,7 +54,6 @@ python builds/build3_hitl_router_agent.py \
 |------|-------------|
 | `--stream` | Enable streaming output from LLM |
 | `--memory` | Enable multi-turn conversation memory |
-| `--tags build3` | Tag all traces (useful for Langfuse logging) |
 
 ---
 
