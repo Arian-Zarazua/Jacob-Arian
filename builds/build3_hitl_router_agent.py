@@ -1,4 +1,13 @@
 """
+INTERACTIVE DATA ANALYSIS AGENT with HITL Routing & Time Series Support
+
+Features:
+- Intelligent routing between tool execution and code generation
+- Time series analysis with temporal aggregation and visualization
+- HITL (Human-In-The-Loop) approval for code execution
+- Support for batch CSV files and single datasets
+- Langfuse integration for tracing (optional)
+
 To interact with the agent, use the following commands:
 
     python builds/build3_hitl_router_agent.py --data data/Stat-Savant/PBP --report_dir reports --tags build3 --memory
@@ -9,12 +18,27 @@ To interact with the agent, use the following commands:
 
     help                         Show this help text
     schema                       Print dataset schema
-    suggest <question>           Questions about the dataset or analysis (LLM)
-    ask <request>                ROUTER decides: tool-run OR codegen (HITL)
-    tool <request>               Force tool-run: choose one Build0 tool + args (HITL)
-    code <request>               Force code generation (HITL) + approve to save
-    run                          Execute last approved script via subprocess (HITL)
+    suggest <question>           Questions about the dataset or analysis (LLM suggestions)
+    ask <request>                ROUTER decides: tool execution OR code generation (HITL)
+    tool <request>               Force tool execution: router selects one tool + args (HITL)
+    code <request>               Force code generation (HITL) + approve to save & run
+    run                          Execute last approved/generated script via subprocess (HITL)
     exit                         Quit
+
+Supported Tools:
+- Data profiling: basic_profile, split_columns
+- Summaries: summarize_numeric, summarize_categorical, missingness_table, pearson_correlation
+- Visualization: plot_histograms, plot_bar_charts, plot_corr_heatmap, plot_cat_num_boxplot
+- Time Series: plot_temporal_line_chart, aggregate_by_temporal_column
+- Modeling: multiple_linear_regression
+- Quality checks: target_check, assert_json_safe
+
+Examples:
+  ask plot average passing yards by season
+  ask create a boxplot of fumbles by position
+  tool temporal line chart of yards by season
+  code create a multi-season trend analysis with rolling averages
+  run
 """
 
 from __future__ import annotations
@@ -489,12 +513,17 @@ def build_suggest_chain(
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
     system_text = (
-        "You are a data analysis assistant.\n"
-        "You ONLY see the dataset schema (columns + dtypes). Do NOT invent columns.\n\n"
+        "You are an expert NFL sports data analyst with expertise in:\n"
+        "- Exploratory data analysis (EDA) of football statistics\n"
+        "- Temporal trends and season-over-season comparisons\n"
+        "- Performance modeling and statistical regression\n"
+        "- Sports analytics visualization best practices\n\n"
+        "You ONLY see the dataset schema (columns + dtypes). Do NOT invent columns.\n"
+        "Prioritize time series and trend analyses when temporal columns are available (e.g., season, year, week, game_id).\n\n"
         "Return:\n"
-        "1) 2-3 plausible research questions (bulleted)\n"
-        "2) For each: outcome(s), predictor(s), and suggested analysis type\n"
-        "3) 5-7 clarifying questions\n"
+        "1) 2-3 plausible research questions (bulleted), prioritizing temporal/trend analyses\n"
+        "2) For each: outcome(s), predictor(s), temporal column (if applicable), and suggested analysis type\n"
+        "3) 5-7 clarifying questions about data scope, time periods, teams/players, and analysis goals\n"
     )
 
     if memory:
@@ -535,7 +564,7 @@ def build_codegen_chain(
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
     system_text = (
-        "You are a careful Python data analysis code generator.\n"
+        "You are a careful Python code generator specializing in NFL sports data analysis.\n"
         "IMPORTANT RULES:\n"
         "- You ONLY know the dataset schema. Do NOT invent columns.\n"
         "- Produce ONE Python script that can run as a standalone file.\n"
@@ -619,13 +648,13 @@ def build_toolplan_chain(
     # allow_str = format_capability_hints(allowed_tools, tool_descriptions)
 
     system_text = dedent("""
-    You are a routing assistant. You pick the single BEST tool to satisfy 
-    a user request from an allow-list of tools.
+    You are an NFL sports analytics tool selector.
+    You pick the single BEST tool to satisfy a user request from an allow-list of analysis tools.
     
     You see:
-    - Dataset schema (columns + dtypes)
+    - Dataset schema (columns + dtypes) from NFL statistics
     - Allow-list tools + tool signatures
-    - User request
+    - User request (coaching staff or analyst query)
 
     Allow-list tools:
     {allow_str}
@@ -633,14 +662,20 @@ def build_toolplan_chain(
     Tool argument names by signature:
     {tool_arg_hints}
 
+    Tool selection guidance (for sports analysis):
+    - For season/temporal trends: prefer plot_temporal_line_chart (e.g., passing yards over seasons)
+    - For categorical breakdowns: summarize_categorical or plot_bar_charts (e.g., by team/position)
+    - For performance relationships: plot_corr_heatmap, plot_cat_num_boxplot, or multiple_linear_regression
+    - For data quality: plot_histograms, plot_missingness, or missingness_table
+
     Return ONLY valid JSON in exactly ONE of these forms.
     
     If you choose a tool:
     ```json
         {{
-        "tool": "<one of the allow-list tool names>",\n'
-        "args": {{ ... }},\n'
-        "note": "one sentence explaining why this tool fits"\n'
+        "tool": "<one of the allow-list tool names>",
+        "args": {{ ... }},
+        "note": "one sentence explaining why this tool fits"
         }}
     ```
     Rules:
@@ -651,8 +686,9 @@ def build_toolplan_chain(
         - IMPORTANT: If the selected tool requires an input column, args MUST include it.
         - Never output an empty args object for summarize_categorical.
         - For summarize_categorical:
-        - If the user requests one column, use args {{"column": "<col>"}}
-        - If the user requests multiple columns, use args {{"cat_cols": ["<col1>", "<col2>"]}}
+          - If the user requests one column, use args {{"column": "<col>"}}
+          - If the user requests multiple columns, use args {{"cat_cols": ["<col1>", "<col2>"]}}
+        - For temporal line charts: include temporal_column and numeric_column parameters
         - Filesystem paths, report directories, and session folders are handled by the runtime.
         
         """)
@@ -681,12 +717,13 @@ def build_router_chain(
     # allow_str = format_capability_hints(allowed_tools, tool_descriptions)
 
     system_text = dedent("""
-    You are a TOOL ROUTER for a data analysis CLI.
+    You are a ROUTER for an NFL sports data analysis system.
+    Your job: intelligently dispatch user requests to either built-in analysis tools OR custom code generation.
 
     You see:
-    - Dataset schema (columns + dtypes)
-    - Allow-list tools + tool signatures
-    - User request
+    - Dataset schema (columns + dtypes) from NFL data sources
+    - Allow-list analysis tools + tool signatures
+    - User request (analyst question about performance, trends, team stats, etc.)
 
     Allow-list tools:
     {allow_str}
@@ -696,8 +733,8 @@ def build_router_chain(
 
     Routing checklist (do this before producing JSON):
     1) Does a tool in the allow-list clearly satisfy the request?
-       - If YES → mode="tool"
-       - If NO  → mode="codegen"
+       - If YES → mode="tool" (fast, deterministic)
+       - If NO  → mode="codegen" (flexible, custom)
     2) If mode="tool":
        - pick the exact tool name from the allow-list
        - extract referenced column names and verify they exist in the schema
@@ -713,8 +750,7 @@ def build_router_chain(
 
     If you choose a tool:
     ```json
-    {{"mode":"tool","tool":"plot_histograms","args":{
-        "numeric_cols":["bill_length_mm","flipper_length_mm"]},"note":"<brief>"}}
+    {{"mode":"tool","tool":"plot_temporal_line_chart","args":{{"temporal_column":"season","numeric_column":"passing_yards"}},"note":"<brief>"}}
     ```
 
     If no tool can satisfy the request:
@@ -723,21 +759,31 @@ def build_router_chain(
     ```
 
     Tool selection guidance (use tool mode when possible):
-    - Dataset overview -> basic_profile
-    - Missing data -> missingness_table or plot_missingness
-    - Categorical summaries / frequency tables -> summarize_categorical
-    - Numeric summaries -> summarize_numeric
-    - Correlations -> pearson_correlation or plot_corr_heatmap
-    - Histograms -> plot_histograms
-    - Bar charts (categorical counts) -> plot_bar_charts
-    - Categorical vs numeric boxplot -> plot_cat_num_boxplot
-    - Linear regression -> multiple_linear_regression
-    - Validate outcome/target column -> target_check
+    - Dataset overview → basic_profile (explore the football data)
+    - Missing data → missingness_table or plot_missingness (data quality check)
+    - Position/Team breakdowns / frequency tables → summarize_categorical
+    - Stats summaries (yards, points, etc.) → summarize_numeric
+    - Performance correlations → pearson_correlation or plot_corr_heatmap
+    - Distribution of player/team metrics → plot_histograms
+    - Team counts, position distribution → plot_bar_charts
+    - Stat trends by team/position → plot_cat_num_boxplot
+    - Season/year trends (line chart) → plot_temporal_line_chart
+    - Aggregated season stats → aggregate_by_temporal_column
+    - Regression analysis (e.g., wins vs. passing yards) → multiple_linear_regression
+    - Validate outcome column → target_check
 
     Tool-specific argument rules:
     - summarize_categorical requires either:
       - one column: args={{"column":"<col>"}}
       - many columns: args={{"cat_cols":["<col1>","<col2>"]}}
+    - plot_temporal_line_chart requires:
+      - temporal_column: the column to group by (season, year, month, etc.)
+      - numeric_column: the single numeric column to plot
+      - aggregation_method (optional): 'mean' (default), 'sum', 'median', 'min', 'max'
+    - aggregate_by_temporal_column requires:
+      - temporal_column: column to group by
+      - numeric_columns: list of numeric columns to aggregate
+      - aggregation_method (optional): 'mean', 'sum', 'median', 'min', 'max'
 
     Examples:
     User: "frequency table for sex"
@@ -757,15 +803,29 @@ def build_router_chain(
     
     User: "histograms for bill_length_mm and flipper_length_mm"
     ```json
-    {
+    {{
         "mode":"tool",
-    "tool":"plot_histograms",
-    "args":{
+        "tool":"plot_histograms",
+        "args":{{
             "numeric_cols":["bill_length_mm","flipper_length_mm"]
-    },
-    "note":"Histogram tool visualizes numeric distributions."
-    }
-```
+        }},
+        "note":"Histogram tool visualizes numeric distributions."
+    }}
+    ```
+
+    User: "plot average passing yards by season"
+    ```json
+    {{
+        "mode":"tool",
+        "tool":"plot_temporal_line_chart",
+        "args":{{
+            "temporal_column":"season",
+            "numeric_column":"passing_yards",
+            "aggregation_method":"mean"
+        }},
+        "note":"Temporal line chart shows trend of passing yards across seasons."
+    }}
+    ```
 """)
 
     prompt = ChatPromptTemplate.from_messages(
@@ -786,14 +846,14 @@ def build_results_summarizer_chain(
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
     system_text = (
-        "You are an expert at explaining data analysis results.\n"
-        "Given a user request and tool outputs, do:\n"
-        "1) What we ran (1-2 sentences)\n"
-        "2) Key results (bullets)\n"
-        "3) Interpretation (plain language)\n"
-        "4) Caveats/assumptions (bullets)\n"
-        "5) Next steps (2-3 suggestions)\n"
-        "Do NOT invent results; use only what is provided.\n"
+        "You are an expert NFL sports analyst at explaining data analysis findings.\n"
+        "Given a user request and analysis outputs, do:\n"
+        "1) What we analyzed (1-2 sentences): the analysis performed and scope\n"
+        "2) Key findings (bullets): the main stats/insights discovered\n"
+        "3) Sports context (plain language): what this means for teams/players\n"
+        "4) Caveats/limitations (bullets): data gaps, edge cases, assumptions\n"
+        "5) Next questions (2-3 suggestions): follow-up analyses to explore\n"
+        "Do NOT invent results; use only what is provided in the tool output.\n"
     )
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -823,21 +883,29 @@ def run_generated_script(
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
 
 
-HELP_TEXT = """Commands:
+HELP_TEXT = """NFL Sports Data Analysis Agent
+
+Commands:
   help                         Show this help text
-  schema                       Print dataset schema
-  suggest <question>           Build1-style suggestions (LLM)
-  ask <request>                ROUTER decides: tool-run OR codegen (HITL)
-  tool <request>               Force tool-run: choose one Build0 tool + args (HITL)
-  code <request>               Force code generation (HITL) + approve to save
-  run                          Execute last approved script via subprocess (HITL)
+  schema                       Print dataset schema (columns + data types)
+  suggest <question>           Get AI suggestions for analyses (LLM recommendations)
+  ask <request>                ROUTER decides: tool execution OR code generation (HITL)
+  tool <request>               Force tool execution: router selects best tool + args (HITL)
+  code <request>               Force code generation (HITL) + you approve before running
+  run                          Execute last approved/generated script via subprocess (HITL)
   exit                         Quit
 
-Examples:
-  ask run a frequency table for sex
-  ask fit a regression of bill_length_mm on flipper_length_mm and sex
-  tool run a correlation heatmap for numeric columns
-  code create a plot of bill_length_mm by species and save it
+Season/Temporal Trend Examples:
+  ask plot average passing yards by season
+  ask show total sacks over years
+  tool temporal line chart for rushing yards by season
+  code create multi-line chart for passing yards and interceptions by season
+
+Team/Position Analysis Examples:
+  ask frequency table for position
+  ask fit a regression of wins on passing_yards and rushing_yards
+  ask show correlation heatmap for offensive metrics
+  code visualize player statistics distribution by team
 """
 
 

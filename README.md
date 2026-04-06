@@ -1,125 +1,161 @@
-# Assignment 3: Build 3 – HITL + Tool Router Agent
+# Assignment 3: Build 3 – HITL + Tool Router Agent with Time Series Support
 
-**Course**: QAC387  
-**Students**: Jacob Poore and Arian Zarazua  
+| | |
+|---|---|
+| **Course** | QAC387 |
+| **Students** | Jacob Poore and Arian Zarazua |
+| **📋 Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log.pdf) |
 
-
-## Overview
-
-This project implements a Human-in-the-Loop (HITL) AI Data Analysis Agent using an LLM-based router.
-
-The agent:
-- Accepts natural language data questions
-- Routes tasks to tools or generates Python code
-- Requires human approval before executing code
-- Returns results with explanations
-- Logs activity using Langfuse
-
-## Repository Structure
-
-builds/        → Main agent (build3_hitl_router_agent.py)  
-data/          → Datasets
-docs/          → Logs, tracing, evaluation  
-knowledge/     → Context or references  
-scripts/       → Helper scripts  
-src/           → Core modules  
-requirements.txt  
-test_modules.py  
+---
 
 
-## How to Run 
+## Installation
 
-1. Install dependencies from root:
-   
-   `pip install -r requirements.txt `
+Install dependencies from the root directory:
+```bash
+pip install -r requirements.txt
+```
 
-2. Set API keys:
-   ```
-   OPENAI_API_KEY=your_key  
-   LANGFUSE_PUBLIC_KEY=your_key 
-   LANGFUSE_SECRET_KEY=your_key  
-   LANGFUSE_BASE_URL = "http://localhost:(open localport, e.g. '3000')"
-   ```
+### Configuration
 
-3. Run:
-4.   # Single file (original behaviour)
-    ``` python
-    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats/Stats-2023.csv --report_dir reports --tags build3 --memory
-    ```
+Set the required API keys:
+```bash
+export OPENAI_API_KEY=your_key
+export LANGFUSE_PUBLIC_KEY=your_key
+export LANGFUSE_SECRET_KEY=your_key
+export LANGFUSE_BASE_URL=http://localhost:3000  # or your port
+```
 
-    (optional) --stream flag to either command above
-  
+On Windows (PowerShell):
+```powershell
+$env:OPENAI_API_KEY="your_key"
+$env:LANGFUSE_PUBLIC_KEY="your_key"
+$env:LANGFUSE_SECRET_KEY="your_key"
+$env:LANGFUSE_BASE_URL="http://localhost:3000"
+```
 
-  **FOR PBP TOOL IT MUST BE STATSAVANT DIR**
+### Running the Agent
 
-## Cautions
+**Single file analysis:**
+```bash
+python builds/build3_hitl_router_agent.py \
+  --data data/Pro-Football-Reference/Stats/Stats-2023.csv \
+  --report_dir reports \
+  --tags build3 \
+  --memory
+```
 
-- Generate code may be incorrect/damaging, review code manually before running  
-- LLM outputs may contain errors  
-- Large datasets may reduce performance (improved w/ future SQL)
-- Certain tools can only be called for a single csv (most existing build0 tools). While we would like to fix that in future agents, when using a directory it will likely be codegen (which is prone to issues above) 
+**Batch processing (directory of CSVs):**
+```bash
+python builds/build3_hitl_router_agent.py \
+  --data data/Pro-Football-Reference/Stats \
+  --report_dir reports \
+  --tags build3 \
+  --memory
+```
+
+**Optional flags:**
+| Flag | Description |
+|------|-------------|
+| `--stream` | Enable streaming output from LLM |
+| `--memory` | Enable multi-turn conversation memory |
+| `--tags build3` | Tag all traces (useful for Langfuse logging) |
+
+---
+
+## 💬 Agent Commands
+
+| Command | Description |
+|---------|-------------|
+| `help` | Show available commands |
+| `schema` | Display dataset schema (columns + data types) |
+| `suggest <question>` | Get AI suggestions for analyses (prioritizes temporal trends) |
+| `ask <request>` | Router decides: tool execution OR code generation (HITL) |
+| `tool <request>` | Force tool execution: router selects best applicable tool |
+| `code <request>` | Force code generation (HITL): review before approving |
+| `run` | Execute last approved/generated script |
+| `exit` | Quit the agent |
+
+---
+
+## Example Use Cases
+
+**Time Series Analysis:**
+```bash
+ask plot average passing yards by season
+ask show quarterback performance trends across years
+```
+
+---
+
+##  Important Cautions & Limitations
+
+###  Code Generation Risks
+- Generated code may be incorrect or unintended—**always review manually before executing**
+- LLM outputs are probabilistic and can contain logical errors
+- Approve reviewed code before running
+
+###  Tool Limitations
+- Some Build0 tools work best with **single CSV files** (batch mode may use code gen instead)
+- Large datasets may reduce performance (SQL integration planned for v2)
+- Tool arguments are validated against schema, but edge cases may occur
+
+###  Time Series Features
+- Temporal analysis is prioritized when time-based columns detected
+- Aggregation handles NULL values gracefully (drops before aggregation) 
 
 
-## Project Context: NFL Data AI Agent
+##  Architecture
 
-This assignment is a core component of our larger project:
+### Intelligent Routing
+The LLM router evaluates user requests and decides between:
+- **Tool Execution** → Dispatches to specialized tools (faster, deterministic)
+- **Code Generation** → Creates custom Python scripts (flexible, custom logic)
 
-"Using AI Agents to Analyze NFL Data"
+### Human-In-The-Loop (HITL)
+- Users review and approve generated code before execution
+- Optional Langfuse logging for activity tracing
 
-Goal:
-Allow users to query a decade of NFL using plain English. 
-
-Example:
-"Who was the best quarterback of the 2010s?"
-
-
-## System Architecture (Planned)
-
-1. LLM Router Agent 
-   - Chooses tools or generates code  
-   - Enforces human approval  
-
-2. NFL Database  
-   - Structured multi-season dataset  
-    - Compiled through https://www.pro-football-reference.com. Their contributors and sources of revelvent statistics are sited:
-    
-          "The majority of our data comes from the work of Pete Palmer, Ken Pullis, and Gary Gillette.
-          Scott Kacsmar is our source for comeback and game-winning drive information.
-          Andrew McKillop is our source for training camp information"
-    - Play by play data downloaded through https://nflsavant.com/about.php. (Are looking for a superior source)
-          "All data and stats from this site are compiled from publicly-available NFL play-by-play data on the internet."
-    - NFL GIS data (official stats)
-          Currently unable to access but are looking for ways to access the datasheets. 
-
-3. NL-to-SQL  
-   - Converts user input into SQL  
-   - Includes retry/self-correction  
+---
 
 
-## Summary
+##  Test Datasets
 
-This assignment builds the decision-making core of a larger AI system that enables natural language exploration of complex sports data.
+### Pro-Football-Reference Data
+```bash
+# Team statistics across multiple seasons
+python builds/build3_hitl_router_agent.py \
+  --data data/Pro-Football-Reference/Stats \
+  --report_dir reports --tags build3 --memory
 
-Our key improvements so far are allowing the request of a directory instead of a single csv file. 
-Altering box plot and bar chart ploting to take in both categoric and numerical columns. 
+# Metadata and contextual information
+python builds/build3_hitl_router_agent.py \
+  --data data/Pro-Football-Reference/Metadata \
+  --report_dir reports --tags build3 --memory
+```
 
-### Additional Run Commands
+### NFL Stat-Savant Play-by-Play Data
+```bash
+# Granular game-level play information
+python builds/build3_hitl_router_agent.py \
+  --data data/Stat-Savant/PBP \
+  --report_dir reports --tags build3 --memory
+```
 
-There are basic run scripts already included, but some additional ones that one might want to try are:
-   **Pro-Football-Reference**
-    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
-    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Metadata --report_dir reports --tags build3 --memory
-    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
-   **Stat-Savant**
-    python builds/build3_hitl_router_agent.py --data data/Stat-Savant/PBP --report_dir reports --tags build3 --memory
-   - Allows testing out the new PBP tool. 
+---
 
-### Issues
+##  Known Issues & Future Work
 
-1) Issues with the agent accidentally calling build0 tools that simply are not what the prompt was asking
-2) Agent calling build0 tools correctly, but routing columns improperly (numerical columns vs categorical columsn on some tools)
-   1) Has been minimized by adding in additional numerical & categorical support for existing tools
-3) Major difficulities with filtering data to a certain year currently (e.g. partiots 2017 to 2018 season difference in XXX column)
-4) Issues with OpenAI generating time series data that doesn't work, or isn't what the prompt asked for. 
-5) Existing Build0 Tools not working when not using a single csv file. 
-6) Had to fix io_utils.py to handle CSV files with malformed rows (a lot of our PBP data has malformed rows)
+### Current Challenges
+| Issue | Status | Notes |
+|-------|--------|-------|
+| **Tool Misselection** | Mitigated | Enhanced prompts reduce incorrect routing |
+| **Stat-Savant PBP Quality** | Ongoing | Malformed CSV rows; handled by `io_utils.py` |
+| **Temporal Column Naming** | Planned | Standardization needed across datasets |
+| **Code Generation Accuracy** | Ongoing | Requires manual review before execution |
+
+### Planned Improvements
+- [ ] Standardize temporal column naming across datasets
+- [ ] Enhance tool-specific prompt engineering for improved column routing
+- [ ] SQL integration for large dataset processing
+- [ ] Better date/season field validation

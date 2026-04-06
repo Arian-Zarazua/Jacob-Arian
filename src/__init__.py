@@ -17,6 +17,8 @@ from .plotting import (
 )
 from .checks import assert_json_safe, target_check
 from .modeling import multiple_linear_regression
+from .time_series import aggregate_by_temporal_column, plot_temporal_line_chart
+from .tools import TOOLS
 
 __all__ = [
     "ensure_dirs",
@@ -35,4 +37,7 @@ __all__ = [
     "assert_json_safe",
     "target_check",
     "multiple_linear_regression",
+    "aggregate_by_temporal_column",
+    "plot_temporal_line_chart",
+    "TOOLS",
 ]
