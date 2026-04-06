@@ -6,6 +6,7 @@ import src.modeling as modeling
 import src.plotting as plotting
 import src.profiling as profiling
 import src.summaries as summaries
+import src.time_series as time_series
 
 # src/tools.py
 
@@ -21,11 +22,14 @@ TOOLS = {
     # modeling
     "multiple_linear_regression": modeling.multiple_linear_regression,
     # plotting
-    "plot_missingness": plotting.plot_missingness,
-    "plot_corr_heatmap": plotting.plot_corr_heatmap,
-    "plot_histograms": plotting.plot_histograms,
-    "plot_bar_charts": plotting.plot_bar_charts,
-    "plot_cat_num_boxplot": plotting.plot_cat_num_boxplot,
+        "plot_missingness": plotting.plot_missingness,
+        "plot_corr_heatmap": plotting.plot_corr_heatmap,
+        "plot_histograms": plotting.plot_histograms,
+        "plot_bar_charts": plotting.plot_bar_charts,
+        "plot_cat_num_boxplot": plotting.plot_cat_num_boxplot,
+    # time series
+        "aggregate_by_temporal_column": time_series.aggregate_by_temporal_column,
+        "plot_temporal_line_chart": time_series.plot_temporal_line_chart,
     # checks
     "assert_json_safe": checks.assert_json_safe,
     "target_check": checks.target_check,
