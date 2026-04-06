@@ -109,6 +109,7 @@ There are basic run scripts already included, but some additional ones that one 
    **Pro-Football-Reference**
     python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
     python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Metadata --report_dir reports --tags build3 --memory
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
    **Stat-Savant**
     python builds/build3_hitl_router_agent.py --data data/Stat-Savant/PBP --report_dir reports --tags build3 --memory
    - Allows testing out the new PBP tool. 
