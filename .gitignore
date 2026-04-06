@@ -62,5 +62,6 @@ build/
 # Langfuse
 # --------------------------------------------------
 infra/
+langfuse/
 langfuse_logs/
 docker-compose.yml

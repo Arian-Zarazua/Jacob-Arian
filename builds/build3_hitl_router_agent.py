@@ -1,35 +1,12 @@
 """
-build3: HITL + Router (Tool Routing + Optional CodeGen/Execute)
-+ Langfuse tracing (LangChain callbacks + observe decorator)
-
-THis build adds a top-level ROUTER that decides whether to:
-    (A) run one of the Build0 tools, OR
-    (B) fall back to CodeGen + optional Execute (subprocess).
-
-It adds a single main command:
-    ask <request>   (router decides tool vs codegen)
-
-Keeps power-user commands:
-    tool <request>  (force tool mode)
-    code <request>  (force codegen mode)
-    run             (execute last approved code)
-
-You will need the expected Build0 tool registry (tools.py in the updated src folder)
-
-Each tool function should accept (df, report_dir, **kwargs) and return either:
-- a string, OR
-- a dict with a "text" field (+ optional "artifact_paths"), OR
-- a tuple (text, artifact_paths)
-
-To run this script, you will need to make sure you have the most updated src and requirements.txt file
-from the course repository.
-
-Then, in the terminal or command line, run:
-  python builds/build3_hitl_router_agent.py --data data/penguins.csv --report_dir reports --tags build3 --memory
-
-  To stream LLM output, add the --stream flag to the command above
-
 To interact with the agent, use the following commands:
+
+    python builds/build3_hitl_router_agent.py --data data/Stat-Savant/PBP --report_dir reports --tags build3 --memory
+
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+
+
+
     help                         Show this help text
     schema                       Print dataset schema
     suggest <question>           Questions about the dataset or analysis (LLM)
@@ -564,11 +541,27 @@ def build_codegen_chain(
         "- Produce ONE Python script that can run as a standalone file.\n"
         "- The script MUST:\n"
         "  (1) use argparse with --data and --report_dir\n"
-        "  (2) read the CSV at --data with pandas\n"
+        "  (2) load data with the helper below — --data may be a single CSV file OR\n"
+        "      a directory of CSV files; the helper handles both cases automatically.\n"
+        "      Always use this exact helper — never call pd.read_csv(args.data) directly:\n\n"
+        "      def load_data(data_path: str) -> pd.DataFrame:\n"
+        "          import pathlib, pandas as pd\n"
+        "          p = pathlib.Path(data_path)\n"
+        "          if p.is_file():\n"
+        "              return pd.read_csv(p)\n"
+        "          files = sorted(p.glob('*.csv'))\n"
+        "          if not files:\n"
+        "              raise FileNotFoundError('No CSVs found in ' + str(p))\n"
+        "          frames = []\n"
+        "          for f in files:\n"
+        "              part = pd.read_csv(f)\n"
+        "              part['_source_file'] = f.stem\n"
+        "              frames.append(part)\n"
+        "          return pd.concat(frames, ignore_index=True, sort=False)\n\n"
         "  (3) handle missing values explicitly\n"
         "  (4) If missing data are present, use listwise deletion unless specified otherwise\n"
-        "  (4) save at least ONE artifact into --report_dir\n"
-        "  (5) validate referenced columns exist (exit nonzero if not)\n\n"
+        "  (5) save at least ONE artifact into --report_dir\n"
+        "  (6) validate referenced columns exist (exit nonzero if not)\n\n"
         "OUTPUT FORMAT (exactly):\n"
         "PLAN:\n"
         "- ...\n\n"
@@ -929,6 +922,63 @@ def traced_summarize(
         )
 
 
+def apply_filter(df: pd.DataFrame, filter_spec: Any) -> tuple[pd.DataFrame, str]:
+    """
+    Apply a router-emitted filter dict to a DataFrame before passing it to a tool.
+
+    The router may emit filter conditions like:
+        {"team": "patriots", "season": 2023}
+        {"market": "New England", "year": 2023}
+
+    Matching is case-insensitive for string columns.
+    Returns (filtered_df, human_readable_description).
+    """
+    if not filter_spec or not isinstance(filter_spec, dict):
+        return df, ""
+
+    # Column name aliases the router commonly uses
+    COL_ALIASES: Dict[str, list[str]] = {
+        "team":   ["team", "market", "team_name", "franchise", "club"],
+        "year":   ["year", "season", "yr", "szn"],
+        "player": ["player", "name", "player_name", "athlete"],
+    }
+
+    mask = pd.Series([True] * len(df), index=df.index)
+    applied: list[str] = []
+
+    for filter_key, filter_val in filter_spec.items():
+        # Find the actual column — try the key directly, then aliases
+        candidates = [filter_key] + COL_ALIASES.get(filter_key, [])
+        col = next((c for c in candidates if c in df.columns), None)
+
+        if col is None:
+            print(f"  [filter] WARNING: no column found for filter key '{filter_key}' "
+                  f"(tried: {candidates}). Skipping.")
+            continue
+
+        if isinstance(filter_val, str):
+            col_str = df[col].astype(str).str.lower()
+            col_mask = col_str.str.contains(filter_val.lower(), na=False)
+        else:
+            col_numeric = pd.to_numeric(df[col], errors="coerce")
+            col_mask = col_numeric == filter_val
+
+        n_match = col_mask.sum()
+        if n_match == 0:
+            print(f"  [filter] WARNING: filter {col}={filter_val!r} matched 0 rows. "
+                  f"Unique values sample: {df[col].dropna().unique()[:8].tolist()}")
+        else:
+            print(f"  [filter] {col}={filter_val!r} → {n_match:,} rows")
+
+        mask &= col_mask
+        applied.append(f"{col}={filter_val!r}")
+
+    filtered = df[mask].copy()
+    desc = ", ".join(applied) if applied else ""
+    print(f"  [filter] Result: {len(filtered):,} rows after filtering ({desc})")
+    return filtered, desc
+
+
 @observe(name="build-run-tool", as_type="span", capture_output=False)
 def traced_run_tool(
     tool_name: str,
@@ -980,6 +1030,27 @@ def traced_run_tool(
     for k in list(tool_args.keys()):
         if k in dir_defaults and isinstance(tool_args[k], str):
             tool_args[k] = Path(tool_args[k])
+
+    # --- Extract and apply filter BEFORE passing args to tool ---
+    filter_spec = tool_args.pop("filter", None) or tool_args.pop("filters", None)
+    if filter_spec:
+        print("\n  [filter] Applying router filter:", filter_spec)
+        df, filter_desc = apply_filter(df, filter_spec)
+        if df.empty:
+            return ToolResult(
+                name=tool_name,
+                artifact_paths=[],
+                text=f"No rows remain after applying filter {filter_spec}. "
+                     "Check column names and values (string matching is case-insensitive).",
+            )
+
+    # --- Strip args the tool doesn't accept (prevents unexpected-kwarg crashes) ---
+    if not accepts_kwargs:
+        unsupported = [k for k in list(tool_args.keys()) if k not in params]
+        if unsupported:
+            print(f"  [args] Dropping unsupported args not in tool signature: {unsupported}")
+            for k in unsupported:
+                tool_args.pop(k)
 
     # --- Trace + execute ---
     with propagate_attributes(
@@ -1281,13 +1352,64 @@ def do_router(
 
 
 # --------------------------------------------------------------------------------------
+# Data loading — single file OR directory of CSVs
+# --------------------------------------------------------------------------------------
+
+def load_data_path(data_path: Path, glob: str = "*.csv") -> pd.DataFrame:
+    """
+    Load a DataFrame from either:
+      - a single file  (CSV, Parquet, Excel — whatever read_data supports), or
+      - a directory    (all files matching *glob* are loaded and concatenated).
+
+    When loading a directory a ``_source_file`` column is added with the stem of
+    each filename (e.g. "Stats-2023") so downstream analysis can reference seasons
+    / splits.  Duplicate column names across files are handled by keeping the union
+    of all columns (missing values become NaN).
+    """
+    if data_path.is_file():
+        return read_data(data_path)
+
+    if not data_path.is_dir():
+        raise FileNotFoundError(f"--data path not found: {data_path}")
+
+    csv_files = sorted(data_path.glob(glob))
+    if not csv_files:
+        raise FileNotFoundError(
+            f"No files matching '{glob}' found in directory: {data_path}"
+        )
+
+    print(f"\n=== DIRECTORY MODE: found {len(csv_files)} file(s) ===")
+    frames: list[pd.DataFrame] = []
+    for f in csv_files:
+        print(f"  Loading: {f.name}")
+        part = read_data(f)
+        part["_source_file"] = f.stem   # e.g. "Stats-2023"
+        frames.append(part)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    print(f"  Combined shape: {combined.shape}\n")
+    return combined
+
+
+# --------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="build3: HITL + Router (Tool Routing + Optional CodeGen/Execute) + Langfuse"
     )
-    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help="Path to a single CSV file OR a directory of CSV files to concatenate.",
+    )
+    parser.add_argument(
+        "--glob",
+        type=str,
+        default="*.csv",
+        help="Glob pattern for matching files when --data is a directory (default: '*.csv').",
+    )
     parser.add_argument("--report_dir", type=str, default="reports")
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.2)
@@ -1308,8 +1430,8 @@ def main() -> None:
     ensure_dirs(report_dir)
     ensure_dirs(report_dir / "tool_outputs")
 
-    # Load data + schema
-    df = read_data(data_path)
+    # Load data + schema — supports single file OR directory of CSVs
+    df = load_data_path(data_path, glob=args.glob)
     df_columns = set(df.columns)
     schema_text = profile_to_schema_text(basic_profile(df))
 
