@@ -645,7 +645,7 @@ def build_toolplan_chain(
 ):
     """Pick one tool + args ONLY (JSON)."""
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
-    # allow_str = format_capability_hints(allowed_tools, tool_descriptions)
+    allow_str = format_capability_hints(allowed_tools, tool_descriptions)
 
     system_text = dedent("""
     You are an NFL sports analytics tool selector.
@@ -665,7 +665,7 @@ def build_toolplan_chain(
     Tool selection guidance (for sports analysis):
     - For season/temporal trends: prefer plot_temporal_line_chart (e.g., passing yards over seasons)
     - For categorical breakdowns: summarize_categorical or plot_bar_charts (e.g., by team/position)
-    - For performance relationships: plot_corr_heatmap, plot_cat_num_boxplot, or multiple_linear_regression
+    - For performance relationships: pearson_correlation (2 numeric vars), plot_corr_heatmap, plot_cat_num_boxplot, or multiple_linear_regression
     - For data quality: plot_histograms, plot_missingness, or missingness_table
 
     Return ONLY valid JSON in exactly ONE of these forms.
@@ -686,12 +686,14 @@ def build_toolplan_chain(
         - IMPORTANT: If the selected tool requires an input column, args MUST include it.
         - Never output an empty args object for summarize_categorical.
         - For summarize_categorical:
-          - If the user requests one column, use args {{"column": "<col>"}}
-          - If the user requests multiple columns, use args {{"cat_cols": ["<col1>", "<col2>"]}}
+          - If the user requests one column, use args {{"column":"<col>"}}
+          - If the user requests multiple columns, use args {{"cat_cols":["<col1>","<col2>"]}}
+        - For pearson_correlation (2-variable correlation):
+          - Use args {{"x":"<col1>","y":"<col2>"}} NOT column1/column2
         - For temporal line charts: include temporal_column and numeric_column parameters
         - Filesystem paths, report directories, and session folders are handled by the runtime.
         
-        """)
+        """).format(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -714,7 +716,7 @@ def build_router_chain(
     stream: bool = False,
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
-    # allow_str = format_capability_hints(allowed_tools, tool_descriptions)
+    allow_str = format_capability_hints(allowed_tools, tool_descriptions)
 
     system_text = dedent("""
     You are a ROUTER for an NFL sports data analysis system.
@@ -763,7 +765,8 @@ def build_router_chain(
     - Missing data → missingness_table or plot_missingness (data quality check)
     - Position/Team breakdowns / frequency tables → summarize_categorical
     - Stats summaries (yards, points, etc.) → summarize_numeric
-    - Performance correlations → pearson_correlation or plot_corr_heatmap
+    - Performance correlations between two variables → pearson_correlation (uses x and y params)
+    - Correlation heatmap across many variables → plot_corr_heatmap
     - Distribution of player/team metrics → plot_histograms
     - Team counts, position distribution → plot_bar_charts
     - Stat trends by team/position → plot_cat_num_boxplot
@@ -776,6 +779,10 @@ def build_router_chain(
     - summarize_categorical requires either:
       - one column: args={{"column":"<col>"}}
       - many columns: args={{"cat_cols":["<col1>","<col2>"]}}
+    - pearson_correlation (2-variable correlation) requires:
+      - x: first numeric column name
+      - y: second numeric column name
+      - ci_level (optional): confidence level (default 0.95)
     - plot_temporal_line_chart requires:
       - temporal_column: the column to group by (season, year, month, etc.)
       - numeric_column: the single numeric column to plot
@@ -813,6 +820,19 @@ def build_router_chain(
     }}
     ```
 
+    User: "correlation between IsInterception and TeamWin"
+    ```json
+    {{
+        "mode":"tool",
+        "tool":"pearson_correlation",
+        "args":{{
+            "x":"IsInterception",
+            "y":"TeamWin"
+        }},
+        "note":"Pearson correlation quantifies relationship between interceptions and team wins."
+    }}
+    ```
+
     User: "plot average passing yards by season"
     ```json
     {{
@@ -826,11 +846,11 @@ def build_router_chain(
         "note":"Temporal line chart shows trend of passing yards across seasons."
     }}
     ```
-""")
+""").format(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessage(content=system_text),  # <-- NOT templated
+            SystemMessage(content=system_text),
             (
                 "human",
                 "Dataset schema:\n{schema_text}\n\nUser request:\n{user_request}\n",
