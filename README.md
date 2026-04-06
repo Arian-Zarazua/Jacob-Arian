@@ -4,7 +4,7 @@
 |---|---|
 | **Course** | QAC387 |
 | **Students** | Jacob Poore and Arian Zarazua |
-| **📋 Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log.pdf) |
+| ** Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log.pdf) |
 
 ---
 
@@ -63,7 +63,7 @@ python builds/build3_hitl_router_agent.py \
 
 ---
 
-## 💬 Agent Commands
+##  Agent Commands
 
 | Command | Description |
 |---------|-------------|
