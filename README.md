@@ -110,6 +110,21 @@ The LLM router evaluates user requests and decides between:
 - Users review and approve generated code before execution
 - Optional Langfuse logging for activity tracing
 
+## 🔍 Retrieval-Augmented Generation (RAG)
+
+### Overview
+- This agent supports Retrieval-Augmented Generation (RAG), which allows it to incorporate external knowledge from a document corpus when generating responses. 
+- RAG is used to improve reasoning in cases where dataset schema alone may be insufficient.
+
+---
+
+**Building the RAG Index**
+
+Before using RAG, build a FAISS index from markdown documents stored in a knowledge directory:
+
+```bash
+python -m builds.build_rag_index --knowledge_dir knowledge
+
 ---
 
 
