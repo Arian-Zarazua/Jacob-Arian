@@ -14,6 +14,9 @@ To interact with the agent, use the following commands:
 
     python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
 
+    ***Build correctly: python -m builds.build_rag_index --knowledge_dir knowledge
+    
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --knowledge_dir knowledge --memory
 
 
     help                         Show this help text
@@ -65,6 +68,17 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
+# import Build0 tools and RAG helpers
+# find path to src for imports, allows the script to be run from project root or builds folder
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from src import ensure_dirs, read_data, basic_profile
+from src.rag_faiss_utils_pdf import (
+    load_faiss_index,
+    retrieve_chunks,
+    format_rag_context,
+)
+
 # always set the location of the .env file to the project root for consistent env var loading
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # project root (parent of /builds)
 load_dotenv(PROJECT_ROOT / ".env")
@@ -103,6 +117,89 @@ except Exception:
 # --------------------------------------------------------------------------------------
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from src import ensure_dirs, read_data, basic_profile  # noqa: E402
+
+
+# --------------------------------------------------------------------------------------
+# Minimal RAG helpers (Build4: retrieval added to codegen path)
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class RagIndex:
+    """Container for a prebuilt FAISS-backed RAG index."""
+
+    index: Any
+    chunks: list[Any]
+    knowledge_dir: Path
+    embedding_model: str
+
+
+def load_saved_rag_index(knowledge_dir: str | Path) -> RagIndex:
+    """Load a previously built FAISS index and its chunk metadata."""
+    knowledge_dir = Path(knowledge_dir)
+    index, chunks, embedding_model = load_faiss_index(knowledge_dir)
+    return RagIndex(
+        index=index,
+        chunks=chunks,
+        knowledge_dir=knowledge_dir,
+        embedding_model=embedding_model,
+    )
+
+
+def prepare_codegen_request_with_rag(
+    req: str,
+    schema_text: str,
+    rag_index: Optional[RagIndex],
+    rag_k: int = 4,
+) -> tuple[str, Optional[str]]:
+    """Augment the codegen request with retrieved context from a saved FAISS index.
+
+    Returns:
+        (augmented_request, pretty_context_or_none)
+    """
+    if rag_index is None:
+        return req, None
+
+    retrieval_query = f"User request: {req}\n\nDataset schema:\n{schema_text}"
+    results = retrieve_chunks(
+        query=retrieval_query,
+        index=rag_index.index,
+        chunks=rag_index.chunks,
+        k=rag_k,
+        embedding_model=rag_index.embedding_model,
+    )
+    rag_context = format_rag_context(results)
+
+    augmented_request = dedent(
+        """
+        Retrieved reference material:
+        {rag_context}
+
+        Original user request:
+        {req}
+
+        Use the retrieved material when it is relevant, but only reference dataset columns 
+        that actually appear in the schema.
+        """
+    ).strip()
+    return augmented_request, rag_context
+
+
+# notification helper to print RAG status in the CLI at startup and after loading the index
+def print_rag_status(rag_index):
+    print("\nRAG STATUS")
+    print("----------")
+
+    if rag_index is None:
+        print("RAG disabled")
+        print("(no knowledge_dir provided)\n")
+        return
+
+    print("RAG enabled")
+    print(f"knowledge_dir  : {rag_index.knowledge_dir}")
+    print(f"chunks loaded  : {len(rag_index.chunks)}")
+    print(f"embedding model: {rag_index.embedding_model}\n")
+
 
 
 # --------------------------------------------------------------------------------------
@@ -1273,8 +1370,29 @@ def do_codegen(
     tags: list[str],
     script_path: Path,
     state: Dict[str, Any],
+    rag_index=None,   # <-- ADD THIS
 ) -> None:
-    out = traced_codegen(codegen_chain, schema_text, req, base_config, stream, tags)
+    # ---- RAG augmentation ----
+    augmented_req, rag_context = prepare_codegen_request_with_rag(
+        req,
+        schema_text,
+        rag_index
+    )
+
+    if rag_context:
+        print("\n=== RAG CONTEXT USED ===\n")
+        print(rag_context[:1000] + "\n")  # truncate for readability
+
+    # ---- Code generation ----
+    out = traced_codegen(
+        codegen_chain,
+        schema_text,
+        augmented_req,
+        base_config,
+        stream,
+        tags,
+    )
+
     candidate = extract_python_code(out)
 
     if not candidate:
@@ -1362,14 +1480,24 @@ def do_router(
     tags: list[str],
     script_path: Path,
     state: Dict[str, Any],
+    rag_index=None,   # <-- ADDED
 ) -> None:
     """
     Router -> (tool-run OR codegen).
     If router selects tool mode but no matching tool exists in TOOLS,
     fall back to code generation.
     """
-    raw = traced_router(router_chain, schema_text, req, base_config, tags)
+
+    # ---- OPTIONAL: RAG-AWARE ROUTING ----
+    augmented_req, _ = prepare_codegen_request_with_rag(
+        req,
+        schema_text,
+        rag_index
+    )
+
+    raw = traced_router(router_chain, schema_text, augmented_req, base_config, tags)
     plan = parse_json_object(raw)
+
     if not plan:
         print("\nERROR: Router did not return valid JSON. Try again.\n")
         print("Raw output was:\n", raw, "\n")
@@ -1386,6 +1514,7 @@ def do_router(
 
     if mode == "tool":
         router_tool = str(plan.get("tool") or "").strip()
+
         if router_tool not in tools:
             print(
                 "Router fallback: no matching tool is available in TOOLS. "
@@ -1400,6 +1529,7 @@ def do_router(
                 tags=tags,
                 script_path=script_path,
                 state=state,
+                rag_index=rag_index,   # <-- FIXED
             )
             return
 
@@ -1421,8 +1551,8 @@ def do_router(
     if mode == "codegen":
         code_req = (plan.get("code_request") or "").strip()
         if not code_req:
-            # fallback: just use the original request
             code_req = req
+
         do_codegen(
             req=code_req,
             codegen_chain=codegen_chain,
@@ -1432,11 +1562,13 @@ def do_router(
             tags=tags,
             script_path=script_path,
             state=state,
+            rag_index=rag_index,   # <-- FIXED
         )
         return
 
     print("\nERROR: Router 'mode' must be 'tool' or 'codegen'. Try again.\n")
     print("Raw output was:\n", raw, "\n")
+
 
 
 # --------------------------------------------------------------------------------------
@@ -1498,6 +1630,12 @@ def main() -> None:
         default="*.csv",
         help="Glob pattern for matching files when --data is a directory (default: '*.csv').",
     )
+    parser.add_argument(
+        "--knowledge_dir",
+        type=str,
+        default=None,
+        help="Path to FAISS RAG index directory",
+    )
     parser.add_argument("--report_dir", type=str, default="reports")
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.2)
@@ -1509,7 +1647,20 @@ def main() -> None:
     parser.add_argument(
         "--tags", type=str, default="build3", help="Comma-separated Langfuse tags"
     )
+
     args = parser.parse_args()
+
+    # ------------------ RAG INDEX LOADING ------------------
+    rag_index = None
+    if args.knowledge_dir:
+        try:
+            rag_index = load_saved_rag_index(args.knowledge_dir)
+        except Exception as e:
+            print(f"WARNING: Failed to load RAG index: {e}")
+            rag_index = None
+
+    print_rag_status(rag_index)
+    # ------------------------------------------------------
 
     tag_list = parse_tags(args.tags)
 
@@ -1518,12 +1669,12 @@ def main() -> None:
     ensure_dirs(report_dir)
     ensure_dirs(report_dir / "tool_outputs")
 
-    # Load data + schema — supports single file OR directory of CSVs
+    # Load data
     df = load_data_path(data_path, glob=args.glob)
     df_columns = set(df.columns)
     schema_text = profile_to_schema_text(basic_profile(df))
 
-    # Load Build0 tools registry
+    # Load tools
     tools = load_tools()
     allowed_tools = sorted(tools.keys())
     tool_descriptions = load_tool_descriptions()
@@ -1623,6 +1774,7 @@ def main() -> None:
                 tags=tag_list,
                 script_path=script_path,
                 state=state,
+                rag_index=rag_index,
             )
             continue
 
@@ -1660,6 +1812,7 @@ def main() -> None:
                 tags=tag_list,
                 script_path=script_path,
                 state=state,
+                rag_index=rag_index,
             )
             continue
 

@@ -29,6 +29,9 @@ from the course repository.
 To run the script:
 python builds/build4_rag_router_agent_faiss.py --data data/penguins.csv --report_dir reports --knowledge_dir knowledge --session_id cli-session --memory
 
+python builds/build4_rag_router_agent_faiss.pyy --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+
+
 To stream LLM output, add the --stream flag to the command above
 
 To interact with the agent, use the following commands:
