@@ -18,7 +18,7 @@ TOOLS = {
     "pearson_correlation": summaries.pearson_correlation,
     # profiling
     "basic_profile": profiling.basic_profile,
-    "split_columns": profiling.split_columns,
+    "split_columns": profiling.split_csolumns,
     # modeling
     "multiple_linear_regression": modeling.multiple_linear_regression,
     # plotting

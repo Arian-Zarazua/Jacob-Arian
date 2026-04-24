@@ -1,24 +1,13 @@
 """
-INTERACTIVE DATA ANALYSIS AGENT with HITL Routing & Time Series Support
-
-Features:
-- Intelligent routing between tool execution and code generation
-- Time series analysis with temporal aggregation and visualization
-- HITL (Human-In-The-Loop) approval for code execution
-- Support for batch CSV files and single datasets
-- Langfuse integration for tracing (optional)
+INTERACTIVE DATA ANALYSIS AGENT
 
 To interact with the agent, use the following commands:
 
-    python builds/build3_hitl_router_agent.py --data data/Stat-Savant/PBP --report_dir reports --tags build3 --memory
+# Without RAG
+python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
 
-    python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
-
-    ***Build correctly: 
-    python -m scripts.build_rag_index --knowledge_dir knowledge
-    
-    python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --knowledge_dir knowledge --memory --tags build4_rag
-
+# With RAG
+python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --knowledge_dir knowledge --session_id cli-session --memory
 
     help                         Show this help text
     schema                       Print dataset schema
@@ -116,16 +105,8 @@ except Exception:
             return False
 
 
-# --------------------------------------------------------------------------------------
-# Import Build0 functions
-# --------------------------------------------------------------------------------------
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from src import ensure_dirs, read_data, basic_profile  # noqa: E402
-
-
-# --------------------------------------------------------------------------------------
-# Minimal RAG helpers (Build4: retrieval added to codegen path)
-# --------------------------------------------------------------------------------------
 
 
 @dataclass
@@ -1636,7 +1617,7 @@ def load_data_path(data_path: Path, glob: str = "*.csv") -> pd.DataFrame:
 # --------------------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="build3: HITL + Router (Tool Routing + Optional CodeGen/Execute) + Langfuse"
+        description="build4: RAG + HITL + Router (Tool Routing + Optional CodeGen/Execute) + Langfuse"
     )
     parser.add_argument(
         "--data",
@@ -1661,7 +1642,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--memory", action="store_true")
     parser.add_argument("--stream", action="store_true")
-    parser.add_argument("--out_file", type=str, default="build3_generated_analysis.py")
+    parser.add_argument("--out_file", type=str, default="build4_generated_analysis.py")
     parser.add_argument("--timeout_s", type=int, default=60)
     parser.add_argument("--session_id", type=str, default="cli-session")
     parser.add_argument(

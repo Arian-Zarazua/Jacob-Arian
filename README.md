@@ -1,10 +1,13 @@
-# Assignment 3: Build 3 – HITL + Tool Router Agent with Time Series Support
+# Assignment 4: Build 4 – NFL Data Analysis Agent
 
 | | |
 |---|---|
 | **Course** | QAC387 |
 | **Students** | Jacob Poore and Arian Zarazua |
-| ** Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log.pdf) |
+| ** Build 4 Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log2.pdf) |
+| ** Build 3 Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log1.pdf) |
+
+
 > [!WARNING]
 > **IMPORTANT:** Do NOT commit or upload Langfuse logs.  
 > These files may contain OpenAI API keys and will be blocked by GitHub push protection.
@@ -28,34 +31,28 @@ export LANGFUSE_SECRET_KEY=your_key
 export LANGFUSE_BASE_URL=http://localhost:3000  # or your port
 ```
 
-
 ### Running the Agent
 
 **Single file analysis:**
 ```bash
-python builds/build3_hitl_router_agent.py \
-  --data data/Pro-Football-Reference/Stats/Stats-2023.csv \
-  --report_dir reports \
-  --tags build3 \
-  --memory
+# Without RAG
+python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/ExpectedPoints-2013.csv --report_dir reports --tags build3 --memory
+
+# With RAG
+python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --knowledge_dir knowledge --session_id cli-session --memory
+
 ```
 
 **Batch processing (directory of CSVs):**
 ```bash
-python builds/build3_hitl_router_agent.py \
-  --data data/Pro-Football-Reference/Stats \
-  --report_dir reports \
-  --tags build3 \
-  --memory
+# Without RAG
+python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+
+# With RAG
+python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --knowledge_dir knowledge --session_id cli-session --memory
+
 ```
 
-**Optional flags:**
-| Flag | Description |
-|------|-------------|
-| `--stream` | Enable streaming output from LLM |
-| `--memory` | Enable multi-turn conversation memory |
-
----
 
 ##  Agent Commands
 
@@ -110,9 +107,7 @@ The LLM router evaluates user requests and decides between:
 - Users review and approve generated code before execution
 - Optional Langfuse logging for activity tracing
 
-## 🔍 Retrieval-Augmented Generation (RAG)
-
-### Overview
+### Retrieval-Augmented Generation (RAG)
 - This agent supports Retrieval-Augmented Generation (RAG), which allows it to incorporate external knowledge from a document corpus when generating responses. 
 - RAG is used to improve reasoning in cases where dataset schema alone may be insufficient.
 
@@ -123,39 +118,13 @@ The LLM router evaluates user requests and decides between:
 Before using RAG, build a FAISS index from markdown documents stored in a knowledge directory:
 
 ```bash
-python -m builds.build_rag_index --knowledge_dir knowledge
-
----
-
-
-##  Test Datasets
-
-### Pro-Football-Reference Data
-```bash
-# Team statistics across multiple seasons
-python builds/build3_hitl_router_agent.py \
-  --data data/Pro-Football-Reference/Stats \
-  --report_dir reports --tags build3 --memory
-
-# Metadata and contextual information
-python builds/build3_hitl_router_agent.py \
-  --data data/Pro-Football-Reference/Metadata \
-  --report_dir reports --tags build3 --memory
+python -m scripts.build_rag_index
 ```
 
-### NFL Stat-Savant Play-by-Play Data
-```bash
-# Granular game-level play information
-python builds/build3_hitl_router_agent.py \
-  --data data/Stat-Savant/PBP \
-  --report_dir reports --tags build3 --memory
-```
 
----
 
 ##  Known Issues & Future Work
 
-### Current Challenges
 | Issue | Status | Notes |
 |-------|--------|-------|
 | **Tool Misselection** | Mitigated | Enhanced prompts reduce incorrect routing |
@@ -164,7 +133,6 @@ python builds/build3_hitl_router_agent.py \
 | **Code Generation Accuracy** | Ongoing | Requires manual review before execution |
 
 ### Planned Improvements
-- [ ] Standardize temporal column naming across datasets
 - [ ] Enhance tool-specific prompt engineering for improved column routing
 - [ ] SQL integration for large dataset processing
 - [ ] Better date/season field validation
