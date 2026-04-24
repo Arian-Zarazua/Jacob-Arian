@@ -218,7 +218,7 @@ def plot_bar_charts(
     df: pd.DataFrame,
     # Router/LLM-friendly args
     x: Optional[str] = None,  # categorical column (preferred)
-    y: Optional[str] = None,  # ignored for bar charts (kept to avoid tool-call crashes)
+    y: Optional[str] = None,  # numeric column for aggregation
     # Back-compat args
     cat_cols: Optional[List[str]] = None,
     column: Optional[str] = None,
@@ -227,15 +227,16 @@ def plot_bar_charts(
     max_cols: int = 12,
     top_k: int = 20,
 ) -> ToolResult:
-    """Save bar charts of category COUNTS for categorical columns (top_k categories).
+    """Save bar charts.
+
+    Behavior:
+    - If y is provided and valid → aggregate (sum) of y by category
+    - Otherwise → frequency table (counts)
 
     Accepts any ONE of:
       - x="species"            (router style)
       - column="species"       (older style)
       - cat_cols=["species","island"]
-
-    'y' is accepted for compatibility with (x, y) tool suggestions, but is not used.
-    Returns artifact_paths + text (agent-friendly); safe for callers that ignore returns.
     """
     if fig_dir is None:
         fig_dir = Path("figures")
@@ -255,32 +256,56 @@ def plot_bar_charts(
             raise ValueError("Provide one of: 'cat_cols', 'column', or 'x'.")
 
     written: List[str] = []
+
     for c in cat_cols[:max_cols]:
         if c not in df.columns:
             raise ValueError(f"Column not found: '{c}'")
 
         plt.figure()
-        counts = df[c].astype("string").value_counts(dropna=True).head(top_k)
-        counts.plot(kind="bar")
-        plt.title(f"Top {min(top_k, len(counts))} values: {c}")
+
+        # 🔥 NEW LOGIC: aggregation vs frequency
+        if y is not None and y in df.columns:
+            plot_df = (
+                df.groupby(c)[y]
+                .sum()
+                .sort_values(ascending=False)
+                .head(top_k)
+            )
+
+            plot_df.plot(kind="bar")
+            plt.title(f"Top {len(plot_df)} {y} by {c}")
+
+        else:
+            plot_df = (
+                df[c]
+                .astype("string")
+                .value_counts(dropna=True)
+                .head(top_k)
+            )
+
+            plot_df.plot(kind="bar")
+            plt.title(f"Top {len(plot_df)} values: {c}")
+
         plt.tight_layout()
+
         out_path = fig_dir / f"bar_{c}.png"
         plt.savefig(out_path, dpi=200)
         plt.close()
+
         written.append(str(out_path))
 
     return make_tool_result(
         name="plot_bar_charts",
-        text=f"Saved {len(written)} bar chart(s) (counts) to {fig_dir}",
+        text=f"Saved {len(written)} bar chart(s) to {fig_dir}",
         artifact_paths=written,
         structured={
             "categorical_columns_plotted": cat_cols[:max_cols],
+            "y_used": y,
             "top_k": top_k,
             "n_bar_charts_saved": len(written),
             "artifact_paths": written,
         },
     )
-
 
 def plot_cat_num_boxplot(
     df: pd.DataFrame,
