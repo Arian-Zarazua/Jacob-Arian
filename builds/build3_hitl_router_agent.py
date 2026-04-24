@@ -1,48 +1,44 @@
 """
-build4: HITL + Router + RAG (FAISS-loaded index + Optional CodeGen/Execute)
-+ Langfuse tracing (LangChain callbacks + observe decorator)
+INTERACTIVE DATA ANALYSIS AGENT with HITL Routing & Time Series Support
 
-THis build adds a top-level ROUTER that decides whether to:
-    (A) run one of the Build0 tools, OR
-    (B) fall back to CodeGen + optional Execute (subprocess).
-
-It adds a single main command:
-    ask <request>   (router decides tool vs codegen)
-
-Keeps power-user commands:
-    tool <request>  (force tool mode)
-    code <request>  (force codegen mode)
-    run             (execute last approved code)
-
-You will need the expected Build0 tool registry (tools.py in the updated src folder)
-
-Each tool function should accept (df, report_dir, **kwargs) and return either:
-- a string, OR
-- a dict with a "text" field (+ optional "artifact_paths"), OR
-- a tuple (text, artifact_paths)
-
-To run this script, you will need to make sure you have the most updated src and requirements.txt file
-from the course repository.
-
-# You will also need to have built the RAG index by running the build_rag_index.py script before running the agent,
-
-To run the script:
-python builds/build4_rag_router_agent_faiss.py --data data/penguins.csv --report_dir reports --knowledge_dir knowledge --session_id cli-session --memory
-
-python builds/build4_rag_router_agent_faiss.pyy --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
-
-
-To stream LLM output, add the --stream flag to the command above
+Features:
+- Intelligent routing between tool execution and code generation
+- Time series analysis with temporal aggregation and visualization
+- HITL (Human-In-The-Loop) approval for code execution
+- Support for batch CSV files and single datasets
+- Langfuse integration for tracing (optional)
 
 To interact with the agent, use the following commands:
+
+    python builds/build3_hitl_router_agent.py --data data/Stat-Savant/PBP --report_dir reports --tags build3 --memory
+
+    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+
+
+
     help                         Show this help text
     schema                       Print dataset schema
-    suggest <question>           Questions about the dataset or analysis (LLM)
-    ask <request>                ROUTER decides: tool-run OR codegen (HITL)
-    tool <request>               Force tool-run: choose one Build0 tool + args (HITL)
-    code <request>               Force code generation (HITL) + approve to save
-    run                          Execute last approved script via subprocess (HITL)
+    suggest <question>           Questions about the dataset or analysis (LLM suggestions)
+    ask <request>                ROUTER decides: tool execution OR code generation (HITL)
+    tool <request>               Force tool execution: router selects one tool + args (HITL)
+    code <request>               Force code generation (HITL) + approve to save & run
+    run                          Execute last approved/generated script via subprocess (HITL)
     exit                         Quit
+
+Supported Tools:
+- Data profiling: basic_profile, split_columns
+- Summaries: summarize_numeric, summarize_categorical, missingness_table, pearson_correlation
+- Visualization: plot_histograms, plot_bar_charts, plot_corr_heatmap, plot_cat_num_boxplot
+- Time Series: plot_temporal_line_chart, aggregate_by_temporal_column
+- Modeling: multiple_linear_regression
+- Quality checks: target_check, assert_json_safe
+
+Examples:
+  ask plot average passing yards by season
+  ask create a boxplot of fumbles by position
+  tool temporal line chart of yards by season
+  code create a multi-season trend analysis with rolling averages
+  run
 """
 
 from __future__ import annotations
@@ -56,7 +52,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, List
+from typing import Any, Callable, Dict, Optional, Tuple
 from textwrap import dedent
 
 import pandas as pd
@@ -66,18 +62,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import SystemMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
-
-# import Build0 tools and RAG helpers
-# find path to src for imports, allows the script to be run from project root or builds folder
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-from src import ensure_dirs, read_data, basic_profile
-from src.rag_faiss_utils_pdf import (
-    load_faiss_index,
-    retrieve_chunks,
-    format_rag_context,
-)
 
 # always set the location of the .env file to the project root for consistent env var loading
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # project root (parent of /builds)
@@ -113,85 +99,10 @@ except Exception:
 
 
 # --------------------------------------------------------------------------------------
-# Minimal RAG helpers (Build4: retrieval added to codegen path)
+# Import Build0 functions
 # --------------------------------------------------------------------------------------
-
-
-@dataclass
-class RagIndex:
-    """Container for a prebuilt FAISS-backed RAG index."""
-
-    index: Any
-    chunks: list[Any]
-    knowledge_dir: Path
-    embedding_model: str
-
-
-def load_saved_rag_index(knowledge_dir: str | Path) -> RagIndex:
-    """Load a previously built FAISS index and its chunk metadata."""
-    knowledge_dir = Path(knowledge_dir)
-    index, chunks, embedding_model = load_faiss_index(knowledge_dir)
-    return RagIndex(
-        index=index,
-        chunks=chunks,
-        knowledge_dir=knowledge_dir,
-        embedding_model=embedding_model,
-    )
-
-
-def prepare_codegen_request_with_rag(
-    req: str,
-    schema_text: str,
-    rag_index: Optional[RagIndex],
-    rag_k: int = 4,
-) -> tuple[str, Optional[str]]:
-    """Augment the codegen request with retrieved context from a saved FAISS index.
-
-    Returns:
-        (augmented_request, pretty_context_or_none)
-    """
-    if rag_index is None:
-        return req, None
-
-    retrieval_query = f"User request: {req}\n\nDataset schema:\n{schema_text}"
-    results = retrieve_chunks(
-        query=retrieval_query,
-        index=rag_index.index,
-        chunks=rag_index.chunks,
-        k=rag_k,
-        embedding_model=rag_index.embedding_model,
-    )
-    rag_context = format_rag_context(results)
-
-    augmented_request = dedent(
-        """
-        Retrieved reference material:
-        {rag_context}
-
-        Original user request:
-        {req}
-
-        Use the retrieved material when it is relevant, but only reference dataset columns 
-        that actually appear in the schema.
-        """
-    ).strip()
-    return augmented_request, rag_context
-
-
-# notification helper to print RAG status in the CLI at startup and after loading the index
-def print_rag_status(rag_index):
-    print("\nRAG STATUS")
-    print("----------")
-
-    if rag_index is None:
-        print("RAG disabled")
-        print("(no knowledge_dir provided)\n")
-        return
-
-    print("RAG enabled")
-    print(f"knowledge_dir  : {rag_index.knowledge_dir}")
-    print(f"chunks loaded  : {len(rag_index.chunks)}")
-    print(f"embedding model: {rag_index.embedding_model}\n")
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from src import ensure_dirs, read_data, basic_profile  # noqa: E402
 
 
 # --------------------------------------------------------------------------------------
@@ -212,34 +123,6 @@ def setup_artifact_dirs(report_dir: Path) -> tuple[Path, Path]:
     return tool_output_dir, tool_figure_dir
 
 
-def sanitize_session_id(session_id: str) -> str:
-    """Make a session id safe for folder names while keeping it readable."""
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", session_id.strip())
-    return safe or "cli-session"
-
-
-def get_session_artifact_dirs(report_dir: Path, session_id: str) -> dict[str, Path]:
-    """Return a consistent session-based artifact directory structure."""
-    safe_session = sanitize_session_id(session_id)
-
-    dirs = {
-        "tool_outputs_root": report_dir / "tool_outputs",
-        "tool_figures_root": report_dir / "tool_figures",
-        "tool_output_session": report_dir / "tool_outputs" / f"session_{safe_session}",
-        "tool_figure_session": report_dir
-        / "tool_figures"
-        / f"session_{safe_session}"
-        / "figures",
-        "generated_session": report_dir / f"session_{safe_session}",
-        "generated_figures": report_dir / f"session_{safe_session}" / "figures",
-    }
-
-    for p in dirs.values():
-        p.mkdir(parents=True, exist_ok=True)
-
-    return dirs
-
-
 def inject_artifact_paths(
     tool_fn,
     tool_name: str,
@@ -254,7 +137,7 @@ def inject_artifact_paths(
     sig = inspect.signature(tool_fn)
     params = sig.parameters
 
-    # Common directory-style params across tools
+    # Common directory-style params across your tools
     dir_param_candidates = {
         "fig_dir": tool_figure_dir,
         "plot_dir": tool_figure_dir,
@@ -271,7 +154,7 @@ def inject_artifact_paths(
         if p in params and p not in args:
             args[p] = default_dir
 
-    # Common single-file “output path” parameters (for tables, single figures, etc.)
+    # Common single-file “output path” parameters (optional but helpful)
     # Only set if the tool takes it AND it wasn't provided.
     file_param_candidates = ["out_path", "output_path", "save_path"]
     for p in file_param_candidates:
@@ -436,7 +319,7 @@ def find_unknown_columns(args_obj: Any, known_columns: set[str]) -> set[str]:
 
 
 def coerce_tool_args(raw_args: Any) -> Dict[str, Any]:
-    """Ensure tool args are a dict so **kwargs calls are safe."""  # kwargs (short for "keyword arguments") in the tool functions expect a dict; this coercion allows for more flexible LLM output formats while keeping the router robust.
+    """Ensure tool args are a dict so **kwargs calls are safe."""
     if isinstance(raw_args, dict):
         return raw_args
     return {}
@@ -509,12 +392,6 @@ def load_tools() -> Dict[str, ToolFn]:
     )
 
 
-# Load tool descriptions for better LLM guidance and print them in the CLI at startup
-# Helps with LLM tool selection and also serves as documentation for users of the CLI.
-# The descriptions are optional but recommended for better LLM performance and user experience.
-# Even if descriptions are missing, the router will still work based on tool names and arg signatures.
-# Helpful even with RAG, as it guides the model on how to use the retrieved context and
-# which tool to pick for which kind of request.
 def load_tool_descriptions() -> Dict[str, str]:
     """Best-effort load of optional TOOL_DESCRIPTIONS from src.tools."""
     try:
@@ -636,12 +513,17 @@ def build_suggest_chain(
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
     system_text = (
-        "You are a data analysis assistant.\n"
-        "You ONLY see the dataset schema (columns + dtypes). Do NOT invent columns.\n\n"
+        "You are an expert NFL sports data analyst with expertise in:\n"
+        "- Exploratory data analysis (EDA) of football statistics\n"
+        "- Temporal trends and season-over-season comparisons\n"
+        "- Performance modeling and statistical regression\n"
+        "- Sports analytics visualization best practices\n\n"
+        "You ONLY see the dataset schema (columns + dtypes). Do NOT invent columns.\n"
+        "Prioritize time series and trend analyses when temporal columns are available (e.g., season, year, week, game_id).\n\n"
         "Return:\n"
-        "1) 2-3 plausible research questions (bulleted)\n"
-        "2) For each: outcome(s), predictor(s), and suggested analysis type\n"
-        "3) 5-7 clarifying questions\n"
+        "1) 2-3 plausible research questions (bulleted), prioritizing temporal/trend analyses\n"
+        "2) For each: outcome(s), predictor(s), temporal column (if applicable), and suggested analysis type\n"
+        "3) 5-7 clarifying questions about data scope, time periods, teams/players, and analysis goals\n"
     )
 
     if memory:
@@ -682,70 +564,44 @@ def build_codegen_chain(
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
     system_text = (
-        "You are a careful Python data analysis code generator.\n"
-        "\n"
-        "Your job is to generate ONE standalone Python script that satisfies the user's exact request.\n"
-        "\n"
-        "CORE PRIORITY:\n"
-        "- Satisfy the user's exact request.\n"
-        "- Do not substitute profiling, generic cleaning, exports, or summaries unless explicitly requested.\n"
-        "- First determine the requested output type: plot, table, model, summary, or transformation.\n"
-        "- The generated code must produce that output type.\n"
-        "\n"
+        "You are a careful Python code generator specializing in NFL sports data analysis.\n"
         "IMPORTANT RULES:\n"
-        "- You ONLY know the dataset schema and any retrieved reference context. Do NOT invent columns.\n"
-        "- Use only the columns needed for the requested task.\n"
-        "- Validate that all referenced columns exist, and exit nonzero if required columns are missing.\n"
-        "- Handle missing values explicitly, but only for the columns needed for the requested task.\n"
-        "- If missing-data handling is not specified, use a simple reasonable default for the required columns only.\n"
-        "- Save at least one relevant artifact into --report_dir.\n"
-        "\n"
-        "GENERAL VS SPECIFIC REQUESTS:\n"
-        "- If the user's request is broad or exploratory, such as 'analyze the data', "
-        "'what should I do first', or 'what analyses make sense', prefer broad workflow guidance.\n"
-        "- For broad exploratory requests, use high-level analysis reasoning and dataset overview logic.\n"
-        "- If the user's request names a specific analysis, variable, model, table, or plot, treat it as specific.\n"
-        "- For specific requests, do not fall back to broad workflow guidance unless explicitly asked.\n"
-        "\n"
-        "SPECIAL RULES BY REQUEST TYPE:\n"
-        "- If the user asks for a plot, chart, graph, figure, or visualization:\n"
-        "  * generate plotting code\n"
-        "  * use the requested variables\n"
-        "  * save the figure into --report_dir\n"
-        "  * do NOT replace the task with profiling, cleaning, or dataset export\n"
-        "  * if the request is numeric by category, choose a reasonable grouped plot such as a boxplot unless the user specifies otherwise\n"
-        "- If the user asks for a model:\n"
-        "  * fit the requested model\n"
-        "  * print and/or save interpretable results\n"
-        "- If the user asks for a table or summary:\n"
-        "  * generate that table or summary directly\n"
-        "  * save it if appropriate\n"
-        "\n"
-        "SCRIPT REQUIREMENTS:\n"
+        "- You ONLY know the dataset schema. Do NOT invent columns.\n"
         "- Produce ONE Python script that can run as a standalone file.\n"
         "- The script MUST:\n"
         "  (1) use argparse with --data and --report_dir\n"
-        "  (2) read the CSV at --data with pandas\n"
-        "  (3) validate referenced columns exist\n"
-        "  (4) create the requested analysis output\n"
-        "  (5) save at least one relevant artifact into --report_dir\n"
-        "\n"
+        "  (2) load data with the helper below — --data may be a single CSV file OR\n"
+        "      a directory of CSV files; the helper handles both cases automatically.\n"
+        "      Always use this exact helper — never call pd.read_csv(args.data) directly:\n\n"
+        "      def load_data(data_path: str) -> pd.DataFrame:\n"
+        "          import pathlib, pandas as pd\n"
+        "          p = pathlib.Path(data_path)\n"
+        "          if p.is_file():\n"
+        "              return pd.read_csv(p)\n"
+        "          files = sorted(p.glob('*.csv'))\n"
+        "          if not files:\n"
+        "              raise FileNotFoundError('No CSVs found in ' + str(p))\n"
+        "          frames = []\n"
+        "          for f in files:\n"
+        "              part = pd.read_csv(f)\n"
+        "              part['_source_file'] = f.stem\n"
+        "              frames.append(part)\n"
+        "          return pd.concat(frames, ignore_index=True, sort=False)\n\n"
+        "  (3) handle missing values explicitly\n"
+        "  (4) If missing data are present, use listwise deletion unless specified otherwise\n"
+        "  (5) save at least ONE artifact into --report_dir\n"
+        "  (6) validate referenced columns exist (exit nonzero if not)\n\n"
         "OUTPUT FORMAT (exactly):\n"
         "PLAN:\n"
-        "- Requested task: ...\n"
-        "- Output type: ...\n"
-        "- Required columns: ...\n"
-        "- Missing-data handling: ...\n"
-        "- Saved artifact: ...\n"
-        "\n"
+        "- ...\n\n"
         "CODE:\n"
         "```python\n"
         "# full script\n"
-        "```\n"
-        "\n"
+        "```\n\n"
         "VERIFY:\n"
         "- ...\n"
     )
+
     if memory:
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -791,44 +647,53 @@ def build_toolplan_chain(
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
     allow_str = format_capability_hints(allowed_tools, tool_descriptions)
 
-    system_text = dedent(
-        """
-        You are a routing assistant. You pick the single BEST tool to satisfy
-        a user request from an allow-list of tools.
+    system_text = dedent("""
+    You are an NFL sports analytics tool selector.
+    You pick the single BEST tool to satisfy a user request from an allow-list of analysis tools.
+    
+    You see:
+    - Dataset schema (columns + dtypes) from NFL statistics
+    - Allow-list tools + tool signatures
+    - User request (coaching staff or analyst query)
 
-        You see:
-        - Dataset schema (columns + dtypes)
-        - Allow-list tools + tool signatures
-        - User request
+    Allow-list tools:
+    {allow_str}
 
-        Allow-list tools:
-        {allow_str}
+    Tool argument names by signature:
+    {tool_arg_hints}
 
-        Tool argument names by signature:
-        {tool_arg_hints}
+    Tool selection guidance (for sports analysis):
+    - For season/temporal trends: prefer plot_temporal_line_chart (e.g., passing yards over seasons)
+    - For categorical breakdowns: summarize_categorical or plot_bar_charts (e.g., by team/position)
+    - For performance relationships: pearson_correlation (2 numeric vars), plot_corr_heatmap, plot_cat_num_boxplot, or multiple_linear_regression
+    - For data quality: plot_histograms, plot_missingness, or missingness_table
 
-        Return ONLY valid JSON in exactly this form:
-        ```json
+    Return ONLY valid JSON in exactly ONE of these forms.
+    
+    If you choose a tool:
+    ```json
         {{
-          "tool": "<one of the allow-list tool names>",
-          "args": {{ ... }},
-          "note": "one sentence explaining why this tool fits"
+        "tool": "<one of the allow-list tool names>",
+        "args": {{ ... }},
+        "note": "one sentence explaining why this tool fits"
         }}
-        ```
-
-        Rules:
+    ```
+    Rules:
         - Use ONLY columns in the schema.
         - args keys MUST use valid parameter names for the selected tool signature above.
         - Do NOT use generic keys like 'column' unless that exact parameter exists.
+        - If there is no tool to complete the request, fall back to codegen mode.
         - IMPORTANT: If the selected tool requires an input column, args MUST include it.
         - Never output an empty args object for summarize_categorical.
         - For summarize_categorical:
-          - If the user requests one column, use args {{"column": "<col>"}}
-          - If the user requests multiple columns, use args {{"cat_cols": ["<col1>", "<col2>"]}}
+          - If the user requests one column, use args {{"column":"<col>"}}
+          - If the user requests multiple columns, use args {{"cat_cols":["<col1>","<col2>"]}}
+        - For pearson_correlation (2-variable correlation):
+          - Use args {{"x":"<col1>","y":"<col2>"}} NOT column1/column2
+        - For temporal line charts: include temporal_column and numeric_column parameters
         - Filesystem paths, report directories, and session folders are handled by the runtime.
-        - Do not include markdown outside the JSON.
-        """
-    )
+        
+        """).format(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -838,7 +703,7 @@ def build_toolplan_chain(
                 "Dataset schema:\n{schema_text}\n\nUser request:\n{user_request}\n",
             ),
         ]
-    ).partial(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
+    )
     return prompt | llm | StrOutputParser()
 
 
@@ -853,86 +718,145 @@ def build_router_chain(
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
     allow_str = format_capability_hints(allowed_tools, tool_descriptions)
 
-    system_text = dedent(
-        """
-        You are a routing assistant for a Python data analysis agent.
+    system_text = dedent("""
+    You are a ROUTER for an NFL sports data analysis system.
+    Your job: intelligently dispatch user requests to either built-in analysis tools OR custom code generation.
 
-        You must choose exactly one mode:
-        - tool: use an existing tool when a suitable tool already exists
-        - codegen: generate custom Python code when no suitable tool exists or the request is too specific
-        - answer: only for simple explanatory questions that do not require running analysis
+    You see:
+    - Dataset schema (columns + dtypes) from NFL data sources
+    - Allow-list analysis tools + tool signatures
+    - User request (analyst question about performance, trends, team stats, etc.)
 
-        You see:
-        - Dataset schema (columns + dtypes)
-        - Allow-list tools + descriptions
-        - Tool argument names by signature
-        - User request
+    Allow-list tools:
+    {allow_str}
 
-        Allow-list tools:
-        {allow_str}
+    Tool argument names by signature:
+    {tool_arg_hints}
 
-        Tool argument names by signature:
-        {tool_arg_hints}
+    Routing checklist (do this before producing JSON):
+    1) Does a tool in the allow-list clearly satisfy the request?
+       - If YES → mode="tool" (fast, deterministic)
+       - If NO  → mode="codegen" (flexible, custom)
+    2) If mode="tool":
+       - pick the exact tool name from the allow-list
+       - extract referenced column names and verify they exist in the schema
+    3) Construct args:
+       - use parameter names from the tool signature hints
+       - include required parameters
+       - do NOT output an empty args object unless the tool truly takes no args
+    
+    The router should only include analysis parameters in args.
+    Filesystem paths, report directories, and session folders are handled by the runtime.
+    
+    Return ONLY valid JSON in exactly ONE of these forms.
 
-        GENERAL VS SPECIFIC REQUESTS:
-        - If the user's request is broad or exploratory, such as "analyze the data",
-          "what should I do first", or "what analyses make sense", prefer broad workflow guidance.
-        - If the user's request names a specific analysis, variable, model, table, or plot, treat it as specific.
-        - For specific requests, do not fall back to broad workflow guidance unless explicitly asked.
+    If you choose a tool:
+    ```json
+    {{"mode":"tool","tool":"plot_temporal_line_chart","args":{{"temporal_column":"season","numeric_column":"passing_yards"}},"note":"<brief>"}}
+    ```
 
-        CORE ROUTING RULES:
-        - Prefer tool mode for standard, repeatable analyses that match an available tool.
-        - Prefer codegen mode for custom analysis requests, unusual combinations, or outputs not covered by tools.
-        - Do not choose codegen if a tool clearly fits the request.
-        - Do not choose tool if no available tool can reasonably satisfy the request.
-        - Satisfy the user's exact request.
+    If no tool can satisfy the request:
+    ```json
+    {{"mode":"codegen","code_request":"<concrete coding request>","note":"<brief>"}}
+    ```
 
-        PLOT-SPECIFIC RULES:
-        - If an existing plotting tool clearly matches the request, choose tool mode.
-        - If no plotting tool clearly matches, choose codegen mode.
-        - For a request like "plot numeric_var by category_var", use a grouped plotting tool if available; otherwise choose codegen.
+    Tool selection guidance (use tool mode when possible):
+    - Dataset overview → basic_profile (explore the football data)
+    - Missing data → missingness_table or plot_missingness (data quality check)
+    - Position/Team breakdowns / frequency tables → summarize_categorical
+    - Stats summaries (yards, points, etc.) → summarize_numeric
+    - Performance correlations between two variables → pearson_correlation (uses x and y params)
+    - Correlation heatmap across many variables → plot_corr_heatmap
+    - Distribution of player/team metrics → plot_histograms
+    - Team counts, position distribution → plot_bar_charts
+    - Stat trends by team/position → plot_cat_num_boxplot
+    - Season/year trends (line chart) → plot_temporal_line_chart
+    - Aggregated season stats → aggregate_by_temporal_column
+    - Regression analysis (e.g., wins vs. passing yards) → multiple_linear_regression
+    - Validate outcome column → target_check
 
-        ARGUMENT RULES:
-        - Only use argument names that match the actual tool signature and tool description.
-        - Never invent argument names.
-        - Never pass precomputed objects unless the tool explicitly expects them.
-        - For plot_corr_heatmap, pass numeric_cols, not corr.
-        - Keep arguments minimal and directly tied to the request.
+    Tool-specific argument rules:
+    - summarize_categorical requires either:
+      - one column: args={{"column":"<col>"}}
+      - many columns: args={{"cat_cols":["<col1>","<col2>"]}}
+    - pearson_correlation (2-variable correlation) requires:
+      - x: first numeric column name
+      - y: second numeric column name
+      - ci_level (optional): confidence level (default 0.95)
+    - plot_temporal_line_chart requires:
+      - temporal_column: the column to group by (season, year, month, etc.)
+      - numeric_column: the single numeric column to plot
+      - aggregation_method (optional): 'mean' (default), 'sum', 'median', 'min', 'max'
+    - aggregate_by_temporal_column requires:
+      - temporal_column: column to group by
+      - numeric_columns: list of numeric columns to aggregate
+      - aggregation_method (optional): 'mean', 'sum', 'median', 'min', 'max'
 
-        Return exactly one JSON object.
+    Examples:
+    User: "frequency table for sex"
+    ```json
+    {{"mode":"tool","tool":"summarize_categorical","args":{{"column":"sex"}},"note":"Frequency table is a categorical summary."}}
+    ```
 
-        Tool mode example:
-        {{
-          "mode": "tool",
-          "tool": "summarize_categorical",
-          "args": {{"column": "sex"}},
-          "note": "A frequency table is a categorical summary."
-        }}
+    User: "frequency tables for sex and island"
+    ```json
+    {{"mode":"tool","tool":"summarize_categorical","args":{{"cat_cols":["sex","island"]}},"note":"Summarize multiple categorical columns."}}
+    ```
 
-        Codegen mode example:
-        {{
-          "mode": "codegen",
-          "code_request": "Create a boxplot of flipper_length_mm by species and save it.",
-          "note": "This is a specific grouped plot not clearly covered by one tool."
-        }}
+    User: "show missingness"
+    ```json
+    {{"mode":"tool","tool":"missingness_table","args":{{}},"note":"Missingness summary is available as a tool."}}
+    ```
+    
+    User: "histograms for bill_length_mm and flipper_length_mm"
+    ```json
+    {{
+        "mode":"tool",
+        "tool":"plot_histograms",
+        "args":{{
+            "numeric_cols":["bill_length_mm","flipper_length_mm"]
+        }},
+        "note":"Histogram tool visualizes numeric distributions."
+    }}
+    ```
 
-        Answer mode example:
-        {{
-          "mode": "answer",
-          "note": "This is a conceptual question that does not require running analysis."
-        }}
-        """
-    )
+    User: "correlation between IsInterception and TeamWin"
+    ```json
+    {{
+        "mode":"tool",
+        "tool":"pearson_correlation",
+        "args":{{
+            "x":"IsInterception",
+            "y":"TeamWin"
+        }},
+        "note":"Pearson correlation quantifies relationship between interceptions and team wins."
+    }}
+    ```
+
+    User: "plot average passing yards by season"
+    ```json
+    {{
+        "mode":"tool",
+        "tool":"plot_temporal_line_chart",
+        "args":{{
+            "temporal_column":"season",
+            "numeric_column":"passing_yards",
+            "aggregation_method":"mean"
+        }},
+        "note":"Temporal line chart shows trend of passing yards across seasons."
+    }}
+    ```
+""").format(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", system_text),
+            SystemMessage(content=system_text),
             (
                 "human",
                 "Dataset schema:\n{schema_text}\n\nUser request:\n{user_request}\n",
             ),
         ]
-    ).partial(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
+    )
 
     return prompt | llm | StrOutputParser()
 
@@ -942,14 +866,14 @@ def build_results_summarizer_chain(
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
     system_text = (
-        "You are an expert at explaining data analysis results.\n"
-        "Given a user request and tool outputs, do:\n"
-        "1) What we ran (1-2 sentences)\n"
-        "2) Key results (bullets)\n"
-        "3) Interpretation (plain language)\n"
-        "4) Caveats/assumptions (bullets)\n"
-        "5) Next steps (2-3 suggestions)\n"
-        "Do NOT invent results; use only what is provided.\n"
+        "You are an expert NFL sports analyst at explaining data analysis findings.\n"
+        "Given a user request and analysis outputs, do:\n"
+        "1) What we analyzed (1-2 sentences): the analysis performed and scope\n"
+        "2) Key findings (bullets): the main stats/insights discovered\n"
+        "3) Sports context (plain language): what this means for teams/players\n"
+        "4) Caveats/limitations (bullets): data gaps, edge cases, assumptions\n"
+        "5) Next questions (2-3 suggestions): follow-up analyses to explore\n"
+        "Do NOT invent results; use only what is provided in the tool output.\n"
     )
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -979,21 +903,29 @@ def run_generated_script(
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
 
 
-HELP_TEXT = """Commands:
+HELP_TEXT = """NFL Sports Data Analysis Agent
+
+Commands:
   help                         Show this help text
-  schema                       Print dataset schema
-  suggest <question>           Build1-style suggestions (LLM)
-  ask <request>                ROUTER decides: tool-run OR codegen (HITL)
-  tool <request>               Force tool-run: choose one Build0 tool + args (HITL)
-  code <request>               Force code generation (HITL) + approve to save
-  run                          Execute last approved script via subprocess (HITL)
+  schema                       Print dataset schema (columns + data types)
+  suggest <question>           Get AI suggestions for analyses (LLM recommendations)
+  ask <request>                ROUTER decides: tool execution OR code generation (HITL)
+  tool <request>               Force tool execution: router selects best tool + args (HITL)
+  code <request>               Force code generation (HITL) + you approve before running
+  run                          Execute last approved/generated script via subprocess (HITL)
   exit                         Quit
 
-Examples:
-  ask run a frequency table for sex
-  ask fit a regression of bill_length_mm on flipper_length_mm and sex
-  tool run a correlation heatmap for numeric columns
-  code create a plot of bill_length_mm by species and save it
+Season/Temporal Trend Examples:
+  ask plot average passing yards by season
+  ask show total sacks over years
+  tool temporal line chart for rushing yards by season
+  code create multi-line chart for passing yards and interceptions by season
+
+Team/Position Analysis Examples:
+  ask frequency table for position
+  ask fit a regression of wins on passing_yards and rushing_yards
+  ask show correlation heatmap for offensive metrics
+  code visualize player statistics distribution by team
 """
 
 
@@ -1078,6 +1010,63 @@ def traced_summarize(
         )
 
 
+def apply_filter(df: pd.DataFrame, filter_spec: Any) -> tuple[pd.DataFrame, str]:
+    """
+    Apply a router-emitted filter dict to a DataFrame before passing it to a tool.
+
+    The router may emit filter conditions like:
+        {"team": "patriots", "season": 2023}
+        {"market": "New England", "year": 2023}
+
+    Matching is case-insensitive for string columns.
+    Returns (filtered_df, human_readable_description).
+    """
+    if not filter_spec or not isinstance(filter_spec, dict):
+        return df, ""
+
+    # Column name aliases the router commonly uses
+    COL_ALIASES: Dict[str, list[str]] = {
+        "team":   ["team", "market", "team_name", "franchise", "club"],
+        "year":   ["year", "season", "yr", "szn"],
+        "player": ["player", "name", "player_name", "athlete"],
+    }
+
+    mask = pd.Series([True] * len(df), index=df.index)
+    applied: list[str] = []
+
+    for filter_key, filter_val in filter_spec.items():
+        # Find the actual column — try the key directly, then aliases
+        candidates = [filter_key] + COL_ALIASES.get(filter_key, [])
+        col = next((c for c in candidates if c in df.columns), None)
+
+        if col is None:
+            print(f"  [filter] WARNING: no column found for filter key '{filter_key}' "
+                  f"(tried: {candidates}). Skipping.")
+            continue
+
+        if isinstance(filter_val, str):
+            col_str = df[col].astype(str).str.lower()
+            col_mask = col_str.str.contains(filter_val.lower(), na=False)
+        else:
+            col_numeric = pd.to_numeric(df[col], errors="coerce")
+            col_mask = col_numeric == filter_val
+
+        n_match = col_mask.sum()
+        if n_match == 0:
+            print(f"  [filter] WARNING: filter {col}={filter_val!r} matched 0 rows. "
+                  f"Unique values sample: {df[col].dropna().unique()[:8].tolist()}")
+        else:
+            print(f"  [filter] {col}={filter_val!r} → {n_match:,} rows")
+
+        mask &= col_mask
+        applied.append(f"{col}={filter_val!r}")
+
+    filtered = df[mask].copy()
+    desc = ", ".join(applied) if applied else ""
+    print(f"  [filter] Result: {len(filtered):,} rows after filtering ({desc})")
+    return filtered, desc
+
+
 @observe(name="build-run-tool", as_type="span", capture_output=False)
 def traced_run_tool(
     tool_name: str,
@@ -1086,12 +1075,12 @@ def traced_run_tool(
     report_dir: Path,
     tool_args: Dict[str, Any],
     tags: list[str],
-    session_id: str,
 ) -> ToolResult:
     # --- Standard artifact folders (always present) ---
-    artifact_dirs = get_session_artifact_dirs(report_dir, session_id)
-    tool_output_dir = artifact_dirs["tool_output_session"]
-    tool_figure_dir = artifact_dirs["tool_figure_session"]
+    tool_output_dir = report_dir / "tool_outputs"
+    tool_figure_dir = report_dir / "tool_figures"
+    tool_output_dir.mkdir(parents=True, exist_ok=True)
+    tool_figure_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Signature inspection (once) ---
     try:
@@ -1129,6 +1118,27 @@ def traced_run_tool(
     for k in list(tool_args.keys()):
         if k in dir_defaults and isinstance(tool_args[k], str):
             tool_args[k] = Path(tool_args[k])
+
+    # --- Extract and apply filter BEFORE passing args to tool ---
+    filter_spec = tool_args.pop("filter", None) or tool_args.pop("filters", None)
+    if filter_spec:
+        print("\n  [filter] Applying router filter:", filter_spec)
+        df, filter_desc = apply_filter(df, filter_spec)
+        if df.empty:
+            return ToolResult(
+                name=tool_name,
+                artifact_paths=[],
+                text=f"No rows remain after applying filter {filter_spec}. "
+                     "Check column names and values (string matching is case-insensitive).",
+            )
+
+    # --- Strip args the tool doesn't accept (prevents unexpected-kwarg crashes) ---
+    if not accepts_kwargs:
+        unsupported = [k for k in list(tool_args.keys()) if k not in params]
+        if unsupported:
+            print(f"  [args] Dropping unsupported args not in tool signature: {unsupported}")
+            for k in unsupported:
+                tool_args.pop(k)
 
     # --- Trace + execute ---
     with propagate_attributes(
@@ -1171,7 +1181,6 @@ def do_tool_run(
     schema_text: str,
     base_config: Dict[str, Any],
     tags: list[str],
-    session_id: str,
 ) -> None:
     """Tool planner -> HITL approve -> run tool -> save output -> summarize."""
     toolplan_raw = traced_toolplan(toolplan_chain, schema_text, req, base_config, tags)
@@ -1192,7 +1201,6 @@ def do_tool_run(
         report_dir=report_dir,
         base_config=base_config,
         tags=tags,
-        session_id=session_id,
         title="TOOL PLAN",
     )
 
@@ -1209,7 +1217,6 @@ def do_tool_run_from_plan(
     report_dir: Path,
     base_config: Dict[str, Any],
     tags: list[str],
-    session_id: str,
     title: str = "TOOL PLAN",
 ) -> None:
     """Run a validated tool plan directly (used by router to avoid a second LLM plan call)."""
@@ -1241,14 +1248,13 @@ def do_tool_run_from_plan(
 
     try:
         res = traced_run_tool(
-            tool_name, tools[tool_name], df, report_dir, tool_args, tags, session_id
+            tool_name, tools[tool_name], df, report_dir, tool_args, tags
         )
     except Exception as e:
         print(f"\nERROR running tool: {e}\n")
         return
 
-    artifact_dirs = get_session_artifact_dirs(report_dir, session_id)
-    out_txt = artifact_dirs["tool_output_session"] / f"{tool_name}_output.txt"
+    out_txt = report_dir / "tool_outputs" / f"{tool_name}_output.txt"
     save_text(out_txt, res.text)
     print(f"\nSaved tool output to: {out_txt}\n")
 
@@ -1267,23 +1273,8 @@ def do_codegen(
     tags: list[str],
     script_path: Path,
     state: Dict[str, Any],
-    rag_index: Optional[RagIndex] = None,
-    rag_k: int = 4,
 ) -> None:
-    codegen_request, rag_context = prepare_codegen_request_with_rag(
-        req=req,
-        schema_text=schema_text,
-        rag_index=rag_index,
-        rag_k=rag_k,
-    )
-
-    if rag_context:
-        print("\n=== RAG CONTEXT RETRIEVED FOR CODEGEN ===\n")
-        print(rag_context + "\n")
-
-    out = traced_codegen(
-        codegen_chain, schema_text, codegen_request, base_config, stream, tags
-    )
+    out = traced_codegen(codegen_chain, schema_text, req, base_config, stream, tags)
     candidate = extract_python_code(out)
 
     if not candidate:
@@ -1314,7 +1305,6 @@ def do_execute(
     report_dir: Path,
     timeout_s: int,
     state: Dict[str, Any],
-    session_id: str,
 ) -> None:
     if not state.get("code_approved") or not script_path.exists():
         print(
@@ -1328,12 +1318,10 @@ def do_execute(
         return
 
     print("\nRunning generated script...\n")
-    artifact_dirs = get_session_artifact_dirs(report_dir, session_id)
-    generated_report_dir = artifact_dirs["generated_session"]
-    run_log_path = generated_report_dir / "run_log.txt"
+    run_log_path = report_dir / "run_log.txt"
     try:
         result = run_generated_script(
-            script_path, data_path, generated_report_dir, timeout_s=timeout_s
+            script_path, data_path, report_dir, timeout_s=timeout_s
         )
     except subprocess.TimeoutExpired:
         msg = f"ERROR: Script timed out after {timeout_s} seconds.\n"
@@ -1344,7 +1332,7 @@ def do_execute(
     log = []
     log.append("=== COMMAND ===\n")
     log.append(
-        f"{sys.executable} {script_path} --data {data_path} --report_dir {generated_report_dir}\n\n"
+        f"{sys.executable} {script_path} --data {data_path} --report_dir {report_dir}\n\n"
     )
     log.append("=== STDOUT ===\n")
     log.append(result.stdout or "(empty)\n")
@@ -1374,9 +1362,6 @@ def do_router(
     tags: list[str],
     script_path: Path,
     state: Dict[str, Any],
-    session_id: str,
-    rag_index: Optional[RagIndex] = None,
-    rag_k: int = 4,
 ) -> None:
     """
     Router -> (tool-run OR codegen).
@@ -1415,8 +1400,6 @@ def do_router(
                 tags=tags,
                 script_path=script_path,
                 state=state,
-                rag_index=rag_index,
-                rag_k=rag_k,
             )
             return
 
@@ -1431,7 +1414,6 @@ def do_router(
             report_dir=report_dir,
             base_config=base_config,
             tags=tags,
-            session_id=session_id,
             title="TOOL PLAN (from router)",
         )
         return
@@ -1450,8 +1432,6 @@ def do_router(
             tags=tags,
             script_path=script_path,
             state=state,
-            rag_index=rag_index,
-            rag_k=rag_k,
         )
         return
 
@@ -1460,35 +1440,74 @@ def do_router(
 
 
 # --------------------------------------------------------------------------------------
+# Data loading — single file OR directory of CSVs
+# --------------------------------------------------------------------------------------
+
+def load_data_path(data_path: Path, glob: str = "*.csv") -> pd.DataFrame:
+    """
+    Load a DataFrame from either:
+      - a single file  (CSV, Parquet, Excel — whatever read_data supports), or
+      - a directory    (all files matching *glob* are loaded and concatenated).
+
+    When loading a directory a ``_source_file`` column is added with the stem of
+    each filename (e.g. "Stats-2023") so downstream analysis can reference seasons
+    / splits.  Duplicate column names across files are handled by keeping the union
+    of all columns (missing values become NaN).
+    """
+    if data_path.is_file():
+        return read_data(data_path)
+
+    if not data_path.is_dir():
+        raise FileNotFoundError(f"--data path not found: {data_path}")
+
+    csv_files = sorted(data_path.glob(glob))
+    if not csv_files:
+        raise FileNotFoundError(
+            f"No files matching '{glob}' found in directory: {data_path}"
+        )
+
+    print(f"\n=== DIRECTORY MODE: found {len(csv_files)} file(s) ===")
+    frames: list[pd.DataFrame] = []
+    for f in csv_files:
+        print(f"  Loading: {f.name}")
+        part = read_data(f)
+        part["_source_file"] = f.stem   # e.g. "Stats-2023"
+        frames.append(part)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    print(f"  Combined shape: {combined.shape}\n")
+    return combined
+
+
+# --------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="build4a: HITL + Router (Tool Routing + Optional CodeGen/Execute) + Langfuse"
+        description="build3: HITL + Router (Tool Routing + Optional CodeGen/Execute) + Langfuse"
     )
-    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help="Path to a single CSV file OR a directory of CSV files to concatenate.",
+    )
+    parser.add_argument(
+        "--glob",
+        type=str,
+        default="*.csv",
+        help="Glob pattern for matching files when --data is a directory (default: '*.csv').",
+    )
     parser.add_argument("--report_dir", type=str, default="reports")
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--memory", action="store_true")
     parser.add_argument("--stream", action="store_true")
-    parser.add_argument("--out_file", type=str, default="agent_generated_analysis.py")
+    parser.add_argument("--out_file", type=str, default="build3_generated_analysis.py")
     parser.add_argument("--timeout_s", type=int, default=60)
-    parser.add_argument(
-        "--knowledge_dir",
-        type=str,
-        default=None,
-        help="Optional path to a knowledge/ folder containing a prebuilt FAISS RAG index and chunk metadata",
-    )
-    parser.add_argument(
-        "--rag_k",
-        type=int,
-        default=4,
-        help="Number of retrieved chunks to inject into codegen",
-    )
     parser.add_argument("--session_id", type=str, default="cli-session")
     parser.add_argument(
-        "--tags", type=str, default="build4", help="Comma-separated Langfuse tags"
+        "--tags", type=str, default="build3", help="Comma-separated Langfuse tags"
     )
     args = parser.parse_args()
 
@@ -1498,11 +1517,9 @@ def main() -> None:
     report_dir = Path(args.report_dir)
     ensure_dirs(report_dir)
     ensure_dirs(report_dir / "tool_outputs")
-    ensure_dirs(report_dir / "tool_figures")
-    session_dirs = get_session_artifact_dirs(report_dir, args.session_id)
 
-    # Load data + schema
-    df = read_data(data_path)
+    # Load data + schema — supports single file OR directory of CSVs
+    df = load_data_path(data_path, glob=args.glob)
     df_columns = set(df.columns)
     schema_text = profile_to_schema_text(basic_profile(df))
 
@@ -1511,24 +1528,6 @@ def main() -> None:
     allowed_tools = sorted(tools.keys())
     tool_descriptions = load_tool_descriptions()
     tool_arg_hints = format_tool_arg_hints(tools, allowed_tools)
-
-    # Optional Build4A RAG index (used on the codegen path only)
-    rag_index: Optional[RagIndex] = None
-    if args.knowledge_dir:
-        knowledge_dir = Path(args.knowledge_dir)
-        if not knowledge_dir.exists():
-            raise FileNotFoundError(f"knowledge_dir does not exist: {knowledge_dir}")
-        print(f"\nLoading saved FAISS RAG index from: {knowledge_dir}")
-        try:
-            rag_index = load_saved_rag_index(knowledge_dir)
-        except FileNotFoundError as e:
-            raise FileNotFoundError(
-                f"{e}\n\nBuild the RAG index first with:\n"
-                f"  python build_rag_index.py --knowledge_dir {knowledge_dir}"
-            ) from e
-        print(
-            f"RAG ready: {len(rag_index.chunks)} chunks loaded using {rag_index.embedding_model}.\n"
-        )
 
     # Chains
     suggest_chain = build_suggest_chain(
@@ -1559,22 +1558,11 @@ def main() -> None:
 
     base_config = make_langfuse_config(session_id=args.session_id, tags=tag_list)
 
-    script_path = session_dirs["generated_session"] / args.out_file
+    script_path = report_dir / args.out_file
 
-    print("\n=== build4a: HITL + Router + RAG ===\n")
+    print("\n=== build3: HITL + Router ===\n")
     print(f"Tags: {tag_list}")
-    print(f"Session artifact folder: {session_dirs['generated_session']}")
-    print(f"Tool output folder   : {session_dirs['tool_output_session']}")
-    print(f"Tool figure folder   : {session_dirs['tool_figure_session']}")
     print(f"Build0 tools loaded: {', '.join(allowed_tools)}\n")
-    if rag_index is not None:
-        print(
-            f"RAG: ENABLED ({len(rag_index.chunks)} chunks from {rag_index.knowledge_dir})\n"
-        )
-    else:
-        print(
-            "RAG: disabled (pass --knowledge_dir to enable Build4A retrieval on codegen)\n"
-        )
 
     if LANGFUSE_AVAILABLE:
         print("Langfuse: ENABLED (CallbackHandler + observe decorator)\n")
@@ -1635,9 +1623,6 @@ def main() -> None:
                 tags=tag_list,
                 script_path=script_path,
                 state=state,
-                session_id=args.session_id,
-                rag_index=rag_index,
-                rag_k=args.rag_k,
             )
             continue
 
@@ -1658,7 +1643,6 @@ def main() -> None:
                 schema_text=schema_text,
                 base_config=base_config,
                 tags=tag_list,
-                session_id=args.session_id,
             )
             continue
 
@@ -1676,8 +1660,6 @@ def main() -> None:
                 tags=tag_list,
                 script_path=script_path,
                 state=state,
-                rag_index=rag_index,
-                rag_k=args.rag_k,
             )
             continue
 
@@ -1688,7 +1670,6 @@ def main() -> None:
                 report_dir=report_dir,
                 timeout_s=args.timeout_s,
                 state=state,
-                session_id=args.session_id,
             )
             continue
 
