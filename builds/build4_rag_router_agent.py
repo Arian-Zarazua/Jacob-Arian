@@ -12,11 +12,12 @@ To interact with the agent, use the following commands:
 
     python builds/build3_hitl_router_agent.py --data data/Stat-Savant/PBP --report_dir reports --tags build3 --memory
 
-    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+    python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
 
-    ***Build correctly: python -m builds.build_rag_index --knowledge_dir knowledge
+    ***Build correctly: 
+    python -m scripts.build_rag_index --knowledge_dir knowledge
     
-    python builds/build3_hitl_router_agent.py --data data/Pro-Football-Reference/Stats --knowledge_dir knowledge --memory
+    python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --knowledge_dir knowledge --memory --tags build4_rag
 
 
     help                         Show this help text
@@ -73,11 +74,14 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from src import ensure_dirs, read_data, basic_profile
+
 from src.rag_faiss_utils_pdf import (
     load_faiss_index,
     retrieve_chunks,
     format_rag_context,
 )
+
+
 
 # always set the location of the .env file to the project root for consistent env var loading
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # project root (parent of /builds)
@@ -152,15 +156,12 @@ def prepare_codegen_request_with_rag(
     rag_index: Optional[RagIndex],
     rag_k: int = 4,
 ) -> tuple[str, Optional[str]]:
-    """Augment the codegen request with retrieved context from a saved FAISS index.
 
-    Returns:
-        (augmented_request, pretty_context_or_none)
-    """
     if rag_index is None:
         return req, None
 
     retrieval_query = f"User request: {req}\n\nDataset schema:\n{schema_text}"
+
     results = retrieve_chunks(
         query=retrieval_query,
         index=rag_index.index,
@@ -168,20 +169,32 @@ def prepare_codegen_request_with_rag(
         k=rag_k,
         embedding_model=rag_index.embedding_model,
     )
+
     rag_context = format_rag_context(results)
 
-    augmented_request = dedent(
-        """
-        Retrieved reference material:
-        {rag_context}
+    # DEBUG (required for grading)
+    print("\n=== RAG RETRIEVAL DEBUG ===")
+    print(f"Query:\n{retrieval_query}\n")
 
-        Original user request:
-        {req}
+    for i, r in enumerate(results):
+        print(f"[Chunk {i+1}]")
+        print(str(r)[:500])
+        print("-" * 40)
 
-        Use the retrieved material when it is relevant, but only reference dataset columns 
-        that actually appear in the schema.
-        """
-    ).strip()
+    print("\n=== FORMATTED RAG CONTEXT ===")
+    print(rag_context[:1000])
+    print("\n===========================\n")
+
+    augmented_request = f"""
+Retrieved reference material:
+{rag_context}
+
+Original user request:
+{req}
+
+Use the retrieved material when relevant. If it conflicts with the schema, prioritize the schema.
+""".strip()
+
     return augmented_request, rag_context
 
 
@@ -581,12 +594,22 @@ def normalize_tool_return(tool_name: str, result: Any) -> ToolResult:
         return ToolResult(name=tool_name, artifact_paths=[], text=result)
 
     if isinstance(result, dict):
-        text = str(result.get("text", ""))
-        artifact_paths = result.get("artifact_paths", []) or []
+        # If tool already follows ToolResult format
+        if "text" in result:
+            text = str(result.get("text", ""))
+            artifact_paths = result.get("artifact_paths", []) or []
+        else:
+            # fallback: treat entire dict as text
+            text = str(result)
+            artifact_paths = []
+
         if not isinstance(artifact_paths, list):
             artifact_paths = [str(artifact_paths)]
+
         return ToolResult(
-            name=tool_name, artifact_paths=[str(p) for p in artifact_paths], text=text
+            name=tool_name,
+            artifact_paths=[str(p) for p in artifact_paths],
+            text=text,
         )
 
     if isinstance(result, tuple) and len(result) == 2:
@@ -596,7 +619,9 @@ def normalize_tool_return(tool_name: str, result: Any) -> ToolResult:
         if not isinstance(artifacts, list):
             artifacts = [artifacts]
         return ToolResult(
-            name=tool_name, artifact_paths=[str(p) for p in artifacts], text=str(text)
+            name=tool_name,
+            artifact_paths=[str(p) for p in artifacts],
+            text=str(text),
         )
 
     return ToolResult(name=tool_name, artifact_paths=[], text=str(result))
@@ -1370,18 +1395,11 @@ def do_codegen(
     tags: list[str],
     script_path: Path,
     state: Dict[str, Any],
-    rag_index=None,   # <-- ADD THIS
+    rag_index=None,
 ) -> None:
-    # ---- RAG augmentation ----
-    augmented_req, rag_context = prepare_codegen_request_with_rag(
-        req,
-        schema_text,
-        rag_index
-    )
-
-    if rag_context:
-        print("\n=== RAG CONTEXT USED ===\n")
-        print(rag_context[:1000] + "\n")  # truncate for readability
+    # ---- RAG already handled at router level ----
+    augmented_req = req
+    rag_context = None
 
     # ---- Code generation ----
     out = traced_codegen(
@@ -1402,6 +1420,7 @@ def do_codegen(
         return
 
     _, _, verify = split_sections(out)
+
     print("=== HUMAN VERIFICATION CHECKLIST (from model) ===")
     print((verify + "\n") if verify else "(No VERIFY section found.)\n")
 
@@ -1412,6 +1431,7 @@ def do_codegen(
 
     state["code_approved"] = candidate
     save_text(script_path, candidate)
+
     print(f"\nApproved and saved to: {script_path}\n")
     print("Next: type 'run' to execute, or 'ask <request>' to route another request.\n")
 
@@ -1480,48 +1500,48 @@ def do_router(
     tags: list[str],
     script_path: Path,
     state: Dict[str, Any],
-    rag_index=None,   # <-- ADDED
+    rag_index=None,
 ) -> None:
-    """
-    Router -> (tool-run OR codegen).
-    If router selects tool mode but no matching tool exists in TOOLS,
-    fall back to code generation.
-    """
 
-    # ---- OPTIONAL: RAG-AWARE ROUTING ----
-    augmented_req, _ = prepare_codegen_request_with_rag(
+    # ===== RAG FIRST =====
+    augmented_req, rag_context = prepare_codegen_request_with_rag(
         req,
         schema_text,
         rag_index
     )
 
-    raw = traced_router(router_chain, schema_text, augmented_req, base_config, tags)
+    rag_signal = ""
+    if rag_context:
+        rag_signal = f"""
+External knowledge available:
+{rag_context[:500]}
+"""
+
+    # ===== ROUTER =====
+    router_input = schema_text + "\n\n" + rag_signal
+
+    raw = traced_router(router_chain, router_input, augmented_req, base_config, tags)
     plan = parse_json_object(raw)
 
     if not plan:
-        print("\nERROR: Router did not return valid JSON. Try again.\n")
-        print("Raw output was:\n", raw, "\n")
+        print("\nERROR: Router did not return valid JSON.\n")
+        print(raw)
         return
 
     mode = (plan.get("mode") or "").strip().lower()
-    note = plan.get("note", "")
 
     print("\n=== ROUTER DECISION ===")
     print(json.dumps(plan, indent=2))
-    if note:
-        print(f"\nNote: {note}")
     print()
 
+    # ===== TOOL PATH =====
     if mode == "tool":
-        router_tool = str(plan.get("tool") or "").strip()
+        tool_name = str(plan.get("tool") or "").strip()
 
-        if router_tool not in tools:
-            print(
-                "Router fallback: no matching tool is available in TOOLS. "
-                "Falling back to code generation.\n"
-            )
+        if tool_name not in tools:
+            print("Fallback → codegen\n")
             do_codegen(
-                req=req,
+                req=augmented_req,
                 codegen_chain=codegen_chain,
                 schema_text=schema_text,
                 base_config=base_config,
@@ -1529,12 +1549,12 @@ def do_router(
                 tags=tags,
                 script_path=script_path,
                 state=state,
-                rag_index=rag_index,   # <-- FIXED
+                rag_index=rag_index,
             )
             return
 
         do_tool_run_from_plan(
-            req=req,
+            req=augmented_req,
             plan=plan,
             summarize_chain=summarize_chain,
             tools=tools,
@@ -1544,14 +1564,12 @@ def do_router(
             report_dir=report_dir,
             base_config=base_config,
             tags=tags,
-            title="TOOL PLAN (from router)",
+            title="TOOL PLAN",
         )
-        return
 
-    if mode == "codegen":
-        code_req = (plan.get("code_request") or "").strip()
-        if not code_req:
-            code_req = req
+    # ===== CODEGEN PATH =====
+    elif mode == "codegen":
+        code_req = plan.get("code_request") or augmented_req
 
         do_codegen(
             req=code_req,
@@ -1562,14 +1580,16 @@ def do_router(
             tags=tags,
             script_path=script_path,
             state=state,
-            rag_index=rag_index,   # <-- FIXED
+            rag_index=rag_index,
         )
-        return
 
-    print("\nERROR: Router 'mode' must be 'tool' or 'codegen'. Try again.\n")
-    print("Raw output was:\n", raw, "\n")
+    else:
+        print("Invalid router mode")
 
-
+    # ===== FINAL RAG STATUS PRINT =====
+    print("\n=== RAG STATUS ===")
+    print("Used RAG:", rag_context is not None)
+    print("==================\n")
 
 # --------------------------------------------------------------------------------------
 # Data loading — single file OR directory of CSVs
