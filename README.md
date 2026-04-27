@@ -33,6 +33,11 @@ export LANGFUSE_BASE_URL=http://localhost:3000  # or your port
 
 ### Running the Agent
 
+**Using Streamlit WebUI:**
+```bash
+ streamlit run .\scripts\app_streamlit_build4.py
+```
+
 **Single file analysis:**
 ```bash
 # Without RAG

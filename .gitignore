@@ -42,6 +42,7 @@ Thumbs.db
 # (generated files should not be versioned)
 # --------------------------------------------------
 reports/
+reports_streamlit/
 figures/
 outputs/
 tool_outputs/
