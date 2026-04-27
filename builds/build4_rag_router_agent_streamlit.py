@@ -1,71 +1,53 @@
 """
-build4 with streamlit UI: HITL + Router (Tool Routing + Optional CodeGen/Execute) + RAG(FAISS retrieval from knowledge base)
-+ Langfuse tracing (LangChain callbacks + observe decorator) + prompt management for router prompt
-
-THis build adds a top-level RAG ROUTER that decides whether to:
-    (A) run one of the Build0 tools, OR
-    (B) fall back to CodeGen + optional Execute (subprocess).
-    (C) Create a streamlit UI to interact with the agent in a more user-friendly way.
-
-
-It includes a single main command:
-    ask <request>   (router decides tool vs codegen)
-
-Keeps power-user commands:
-    tool <request>  (force tool mode)
-    code <request>  (force codegen mode)
-    run             (execute last approved code)
-
-You will need the expected Build0 tool registry (tools.py in the updated src folder)
-
-Each tool function should accept (df, report_dir, **kwargs) and ideally return ToolResult.
-
-The runtime is backward compatible and will also normalize:
-- a string
-- a dict with "text" and optional "artifact_paths"
-- a tuple of (text, artifact_paths)
-
-To run this script, you will need to make sure you have the most updated src and requirements.txt file
-from the course repository.
-
-Then, in the terminal or command line, run:
-  python builds/build4_rag_router_agent_prompt_mgmt.py --data data/penguins.csv --knowledge_dir knowledge --report_dir reports --tags build4 --memory
-
-  To stream LLM output, add the --stream flag to the command above
+INTERACTIVE DATA ANALYSIS AGENT
 
 To interact with the agent, use the following commands:
+
+# Without RAG
+python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
+
+# With RAG
+python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --knowledge_dir knowledge --session_id cli-session --memory
+
     help                         Show this help text
     schema                       Print dataset schema
-    suggest <question>           Questions about the dataset or analysis (LLM)
-    ask <request>                ROUTER decides: tool-run OR codegen (HITL)
-    tool <request>               Force tool-run: choose one Build0 tool + args (HITL)
-    code <request>               Force code generation (HITL) + approve to save
-    run                          Execute last approved script via subprocess (HITL)
+    suggest <question>           Questions about the dataset or analysis (LLM suggestions)
+    ask <request>                ROUTER decides: tool execution OR code generation (HITL)
+    tool <request>               Force tool execution: router selects one tool + args (HITL)
+    code <request>               Force code generation (HITL) + approve to save & run
+    run                          Execute last approved/generated script via subprocess (HITL)
     exit                         Quit
+
+Supported Tools:
+- Data profiling: basic_profile, split_columns
+- Summaries: summarize_numeric, summarize_categorical, missingness_table, pearson_correlation
+- Visualization: plot_histograms, plot_bar_charts, plot_corr_heatmap, plot_cat_num_boxplot
+- Time Series: plot_temporal_line_chart, aggregate_by_temporal_column
+- Modeling: multiple_linear_regression
+- Quality checks: target_check, assert_json_safe
+
+Examples:
+  ask plot average passing yards by season
+  ask create a boxplot of fumbles by position
+  tool temporal line chart of yards by season
+  code create a multi-season trend analysis with rolling averages
+  run
 """
 
 from __future__ import annotations
 
 import argparse
-
-# from ast import If
-# import code
 import importlib
 import inspect
 import json
-
-# from os import read
 import re
 import subprocess
 import sys
-
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Optional, Tuple
 from textwrap import dedent
-# from wsgiref import validate
 
-# from matplotlib.pylab import save
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -76,34 +58,32 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
-# Add project root to Python path for findingbuilds folder and importing src modules;
+# import Build0 tools and RAG helpers
+# find path to src for imports, allows the script to be run from project root or builds folder
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-# import the ToolResult dataclass and normalize_tool_return function
-# for consistent tool output formatting
-from src.utils.tool_result_utils import ToolResult, normalize_tool_return
-
 from src import ensure_dirs, read_data, basic_profile
+
 from src.rag_faiss_utils_pdf import (
     load_faiss_index,
     retrieve_chunks,
     format_rag_context,
 )
 
-load_dotenv(".env")
 
+
+# always set the location of the .env file to the project root for consistent env var loading
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # project root (parent of /builds)
+load_dotenv(PROJECT_ROOT / ".env")
 
 # --------------------------------------------------------------------------------------
 # Langfuse instrumentation
 # --------------------------------------------------------------------------------------
 LANGFUSE_AVAILABLE = False
-langfuse = None
-
 try:
-    from langfuse import get_client as lf_get_client, observe, propagate_attributes  # type: ignore
+    from langfuse import observe, propagate_attributes  # type: ignore
     from langfuse.langchain import CallbackHandler  # type: ignore
 
-    langfuse = lf_get_client()
     LANGFUSE_AVAILABLE = True
 except Exception:
     LANGFUSE_AVAILABLE = False
@@ -125,56 +105,8 @@ except Exception:
             return False
 
 
-# --------------------------------------------------------------------------------------
-# New helper code for Langfuse prompt management
-# --------------------------------------------------------------------------------------
-def load_langfuse_prompt(
-    prompt_name: str,
-    label: str = "dev",
-) -> tuple[Any, Dict[str, Any]]:
-    if not LANGFUSE_AVAILABLE or langfuse is None:
-        raise RuntimeError("Langfuse is not available.")
-
-    prompt = langfuse.get_prompt(prompt_name, label=label, cache_ttl_seconds=0)
-
-    cfg = getattr(prompt, "config", None) or {}
-    return prompt, cfg
-
-
-def get_prompt_config_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Safe defaults for prompt-managed settings.
-    """
-    return {
-        "model": cfg.get("model", "gpt-4o-mini"),
-        "temperature": float(cfg.get("temperature", 0.0)),
-        "stream": bool(cfg.get("stream", False)),
-    }
-
-
-def compile_router_prompt_from_langfuse(
-    *,
-    prompt_name: str,
-    label: str,
-    allowed_tools: list[str],
-    tool_descriptions: Dict[str, str],
-    tool_arg_hints: str,
-) -> tuple[str, Any, Dict[str, Any]]:
-    prompt, cfg = load_langfuse_prompt(prompt_name=prompt_name, label=label)
-
-    allowed_tools_text = format_capability_hints(allowed_tools, tool_descriptions)
-
-    compiled_prompt = prompt.compile(
-        allowed_tools_text=allowed_tools_text,
-        tool_arg_hints=tool_arg_hints,
-    )
-
-    return str(compiled_prompt), prompt, cfg
-
-
-# --------------------------------------------------------------------------------------
-# Minimal RAG helpers (Build4: retrieval added to codegen path)
-# --------------------------------------------------------------------------------------
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from src import ensure_dirs, read_data, basic_profile  # noqa: E402
 
 
 @dataclass
@@ -205,10 +137,12 @@ def prepare_codegen_request_with_rag(
     rag_index: Optional[RagIndex],
     rag_k: int = 4,
 ) -> tuple[str, Optional[str]]:
+
     if rag_index is None:
         return req, None
 
     retrieval_query = f"User request: {req}\n\nDataset schema:\n{schema_text}"
+
     results = retrieve_chunks(
         query=retrieval_query,
         index=rag_index.index,
@@ -216,20 +150,31 @@ def prepare_codegen_request_with_rag(
         k=rag_k,
         embedding_model=rag_index.embedding_model,
     )
+
     rag_context = format_rag_context(results)
 
-    augmented_request = dedent(
-        f"""
-        Retrieved reference material:
-        {rag_context}
+    # DEBUG (required for grading)
+    print("\n=== RAG RETRIEVAL DEBUG ===")
+    print(f"Query:\n{retrieval_query}\n")
 
-        Original user request:
-        {req}
+    for i, r in enumerate(results):
+        print(f"[Chunk {i+1}]")
+        print(str(r)[:500])
+        print("-" * 40)
 
-        Use the retrieved material when it is relevant, but only reference dataset columns
-        that actually appear in the schema.
-        """
-    ).strip()
+    print("\n=== FORMATTED RAG CONTEXT ===")
+    print(rag_context[:1000])
+    print("\n===========================\n")
+
+    augmented_request = f"""
+Retrieved reference material:
+{rag_context}
+
+Original user request:
+{req}
+
+Use the retrieved material when relevant. If it conflicts with the schema, prioritize the schema.
+""".strip()
 
     return augmented_request, rag_context
 
@@ -250,8 +195,9 @@ def print_rag_status(rag_index):
     print(f"embedding model: {rag_index.embedding_model}\n")
 
 
+
 # --------------------------------------------------------------------------------------
-# Artifact Helpers
+# Helpers
 # --------------------------------------------------------------------------------------
 
 
@@ -304,8 +250,8 @@ def inject_artifact_paths(
     file_param_candidates = ["out_path", "output_path", "save_path"]
     for p in file_param_candidates:
         if p in params and p not in args:
-            # Choose an extension that won’t break most tools; many plotting functions accept .png
-            # and table functions often accept .csv/.json. If tool needs a specific extension, it should
+            # Choose an extension that won’t break most tools; many plotting funcs accept .png
+            # and table funcs often accept .csv/.json. If tool needs a specific ext, it should
             # set its own default or the router can pass it explicitly.
             default_path = tool_output_dir / f"{tool_name}_output"
             args[p] = default_path
@@ -384,42 +330,34 @@ def parse_json_object(raw: str) -> Dict[str, Any]:
     """
     Parse a JSON object from:
       - raw JSON text
-      - a fenced ```json block
-      - or a near-JSON object that uses doubled braces like {{ ... }}
-
+      - or a fenced ```json block
     Returns {} on failure.
     """
     raw = (raw or "").strip()
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except json.JSONDecodeError:
+        pass
 
-    candidates = [raw]
-
-    # If the model copied doubled braces from prompt examples, normalize them.
-    if "{{" in raw or "}}" in raw:
-        candidates.append(raw.replace("{{", "{").replace("}}", "}"))
-
-    # If wrapped in a fenced json block, try that too.
     match = JSON_BLOCK_RE.search(raw)
     if match:
-        block = match.group(1).strip()
-        candidates.append(block)
-        if "{{" in block or "}}" in block:
-            candidates.append(block.replace("{{", "{").replace("}}", "}"))
+        try:
+            obj = json.loads(match.group(1))
+            return obj if isinstance(obj, dict) else {}
+        except json.JSONDecodeError:
+            pass
 
-    # Fallback: try substring from first { to last }
+    # Fallback: parse between the first '{' and last '}'.
+    # This helps with model outputs that include extra pre/post text.
     i = raw.find("{")
     j = raw.rfind("}")
     if i != -1 and j != -1 and j > i:
-        sub = raw[i : j + 1].strip()
-        candidates.append(sub)
-        if "{{" in sub or "}}" in sub:
-            candidates.append(sub.replace("{{", "{").replace("}}", "}"))
-
-    for text in candidates:
         try:
-            obj = json.loads(text)
+            obj = json.loads(raw[i : j + 1])
             return obj if isinstance(obj, dict) else {}
         except json.JSONDecodeError:
-            continue
+            return {}
 
     return {}
 
@@ -533,18 +471,15 @@ def load_tools() -> Dict[str, ToolFn]:
             continue
 
     raise RuntimeError(
-        dedent("""
-        Could not import a TOOLS registry.
-        Create src/tools.py with something like:
-        from src.some_build0_module import describe_numeric, freq_table, simple_ols
-        TOOLS = {
-        'describe_numeric': describe_numeric,
-        'freq_table': freq_table,
-        'simple_ols': simple_ols,
-        }
-        Then rerun this script.
-        
-        """)
+        "Could not import a TOOLS registry.\n\n"
+        "Create src/tools.py with something like:\n\n"
+        "  from src.some_build0_module import describe_numeric, freq_table, simple_ols\n"
+        "  TOOLS = {\n"
+        "      'describe_numeric': describe_numeric,\n"
+        "      'freq_table': freq_table,\n"
+        "      'simple_ols': simple_ols,\n"
+        "  }\n\n"
+        "Then rerun this script."
     )
 
 
@@ -617,6 +552,62 @@ def format_tool_arg_hints(tools: Dict[str, ToolFn], allowed_tools: list[str]) ->
     return "\n".join(lines)
 
 
+@dataclass
+class ToolResult:
+    name: str
+    artifact_paths: list[str]
+    text: str
+
+
+def normalize_tool_return(tool_name: str, result: Any) -> ToolResult:
+    """
+    Normalize tool returns into ToolResult.
+
+    Accepted return types:
+      - str
+      - dict with 'text' and optional 'artifact_paths'
+      - tuple(text, artifact_paths)
+    """
+    if isinstance(result, ToolResult):
+        return result
+
+    if isinstance(result, str):
+        return ToolResult(name=tool_name, artifact_paths=[], text=result)
+
+    if isinstance(result, dict):
+        # If tool already follows ToolResult format
+        if "text" in result:
+            text = str(result.get("text", ""))
+            artifact_paths = result.get("artifact_paths", []) or []
+        else:
+            # fallback: treat entire dict as text
+            text = str(result)
+            artifact_paths = []
+
+        if not isinstance(artifact_paths, list):
+            artifact_paths = [str(artifact_paths)]
+
+        return ToolResult(
+            name=tool_name,
+            artifact_paths=[str(p) for p in artifact_paths],
+            text=text,
+        )
+
+    if isinstance(result, tuple) and len(result) == 2:
+        text, artifacts = result
+        if artifacts is None:
+            artifacts = []
+        if not isinstance(artifacts, list):
+            artifacts = [artifacts]
+        return ToolResult(
+            name=tool_name,
+            artifact_paths=[str(p) for p in artifacts],
+            text=str(text),
+        )
+
+    return ToolResult(name=tool_name, artifact_paths=[], text=str(result))
+
+
 # --------------------------------------------------------------------------------------
 # Chains
 # --------------------------------------------------------------------------------------
@@ -624,19 +615,24 @@ def build_suggest_chain(
     model: str, temperature: float = 0.2, stream: bool = False, memory: bool = False
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
-    suggest_system_text = """
-        You are a data analysis assistant.
-        You ONLY see the dataset schema (columns + dtypes). Do NOT invent columns.
-        Return:
-        1) 2-3 plausible research questions that can be tested based on the dataset (bulleted)
-        2) For each: outcome(s), predictor(s), and suggested analysis type
-        3) 5-7 clarifying questions
-        """
+    system_text = (
+        "You are an expert NFL sports data analyst with expertise in:\n"
+        "- Exploratory data analysis (EDA) of football statistics\n"
+        "- Temporal trends and season-over-season comparisons\n"
+        "- Performance modeling and statistical regression\n"
+        "- Sports analytics visualization best practices\n\n"
+        "You ONLY see the dataset schema (columns + dtypes). Do NOT invent columns.\n"
+        "Prioritize time series and trend analyses when temporal columns are available (e.g., season, year, week, game_id).\n\n"
+        "Return:\n"
+        "1) 2-3 plausible research questions (bulleted), prioritizing temporal/trend analyses\n"
+        "2) For each: outcome(s), predictor(s), temporal column (if applicable), and suggested analysis type\n"
+        "3) 5-7 clarifying questions about data scope, time periods, teams/players, and analysis goals\n"
+    )
 
     if memory:
         prompt = ChatPromptTemplate.from_messages(
             [
-                SystemMessage(content=suggest_system_text),
+                ("system", system_text),
                 ("human", "Dataset schema:\n{schema_text}"),
                 MessagesPlaceholder(variable_name="history"),
                 ("human", "User question:\n{user_query}"),
@@ -645,7 +641,7 @@ def build_suggest_chain(
     else:
         prompt = ChatPromptTemplate.from_messages(
             [
-                SystemMessage(content=suggest_system_text),
+                ("system", system_text),
                 (
                     "human",
                     "Dataset schema:\n{schema_text}\n\nUser question:\n{user_query}\n",
@@ -670,38 +666,49 @@ def build_codegen_chain(
     model: str, temperature: float = 0.2, stream: bool = False, memory: bool = False
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
-    codegen_system_text = """
-    You are a careful Python data analysis code generator.
-
-    IMPORTANT RULES:
-    - You ONLY know the dataset schema. Do NOT invent columns.
-    - Produce ONE Python script that can run as a standalone file.
-    - The script MUST:
-      (1) use argparse with --data and --report_dir
-      (2) read the CSV at --data with pandas
-      (3) handle missing values explicitly
-      (4) If missing data are present, use listwise deletion unless specified otherwise.
-      (5) save at least ONE artifact into --report_dir
-      (6) validate referenced columns exist (exit nonzero if not)
-
-    OUTPUT FORMAT (exactly):
-
-    PLAN:
-    - ...brief plan for the analysis and what the code will do...
-
-    CODE:
-    ```python
-    # full script
-    ```
-
-    VERIFY:
-    - ...brief verification checklist to ensure code correctness and validity...
-    """
+    system_text = (
+        "You are a careful Python code generator specializing in NFL sports data analysis.\n"
+        "IMPORTANT RULES:\n"
+        "- You ONLY know the dataset schema. Do NOT invent columns.\n"
+        "- Produce ONE Python script that can run as a standalone file.\n"
+        "- The script MUST:\n"
+        "  (1) use argparse with --data and --report_dir\n"
+        "  (2) load data with the helper below — --data may be a single CSV file OR\n"
+        "      a directory of CSV files; the helper handles both cases automatically.\n"
+        "      Always use this exact helper — never call pd.read_csv(args.data) directly:\n\n"
+        "      def load_data(data_path: str) -> pd.DataFrame:\n"
+        "          import pathlib, pandas as pd\n"
+        "          p = pathlib.Path(data_path)\n"
+        "          if p.is_file():\n"
+        "              return pd.read_csv(p)\n"
+        "          files = sorted(p.glob('*.csv'))\n"
+        "          if not files:\n"
+        "              raise FileNotFoundError('No CSVs found in ' + str(p))\n"
+        "          frames = []\n"
+        "          for f in files:\n"
+        "              part = pd.read_csv(f)\n"
+        "              part['_source_file'] = f.stem\n"
+        "              frames.append(part)\n"
+        "          return pd.concat(frames, ignore_index=True, sort=False)\n\n"
+        "  (3) handle missing values explicitly\n"
+        "  (4) If missing data are present, use listwise deletion unless specified otherwise\n"
+        "  (5) save at least ONE artifact into --report_dir\n"
+        "  (6) validate referenced columns exist (exit nonzero if not)\n\n"
+        "OUTPUT FORMAT (exactly):\n"
+        "PLAN:\n"
+        "- ...\n\n"
+        "CODE:\n"
+        "```python\n"
+        "# full script\n"
+        "```\n\n"
+        "VERIFY:\n"
+        "- ...\n"
+    )
 
     if memory:
         prompt = ChatPromptTemplate.from_messages(
             [
-                SystemMessage(content=codegen_system_text),
+                ("system", system_text),
                 ("human", "Dataset schema:\n{schema_text}"),
                 MessagesPlaceholder(variable_name="history"),
                 ("human", "User request:\n{user_request}"),
@@ -710,7 +717,7 @@ def build_codegen_chain(
     else:
         prompt = ChatPromptTemplate.from_messages(
             [
-                SystemMessage(content=codegen_system_text),
+                ("system", system_text),
                 (
                     "human",
                     "Dataset schema:\n{schema_text}\n\nUser request:\n{user_request}\n",
@@ -719,7 +726,6 @@ def build_codegen_chain(
         )
 
     base_chain = prompt | llm | StrOutputParser()
-
     if not memory:
         return base_chain
 
@@ -742,53 +748,59 @@ def build_toolplan_chain(
 ):
     """Pick one tool + args ONLY (JSON)."""
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
-
     allow_str = format_capability_hints(allowed_tools, tool_descriptions)
 
-    build_toolplan_system_text = dedent("""
+    system_text = dedent("""
+    You are an NFL sports analytics tool selector.
+    You pick the single BEST tool to satisfy a user request from an allow-list of analysis tools.
+    
+    You see:
+    - Dataset schema (columns + dtypes) from NFL statistics
+    - Allow-list tools + tool signatures
+    - User request (coaching staff or analyst query)
+
+    Allow-list tools:
+    {allow_str}
+
+    Tool argument names by signature:
+    {tool_arg_hints}
+
+    Tool selection guidance (for sports analysis):
+    - For season/temporal trends: prefer plot_temporal_line_chart (e.g., passing yards over seasons)
+    - For categorical breakdowns: summarize_categorical or plot_bar_charts (e.g., by team/position)
+    - For performance relationships: pearson_correlation (2 numeric vars), plot_corr_heatmap, plot_cat_num_boxplot, or multiple_linear_regression
+    - For data quality: plot_histograms, plot_missingness, or missingness_table
+
     Return ONLY valid JSON in exactly ONE of these forms.
+    
     If you choose a tool:
-    {"mode":"tool","tool":"plot_histograms","args":{"numeric_cols":["numeric_col","numeric_col"]},"note":"<brief>"}
-
-    If no tool can satisfy the request:
-    {"mode":"codegen","code_request":"<brief concrete coding request>","note":"<brief>"}
-    
+    ```json
+        {{
+        "tool": "<one of the allow-list tool names>",
+        "args": {{ ... }},
+        "note": "one sentence explaining why this tool fits"
+        }}
+    ```
     Rules:
-    - Use ONLY columns in the schema.
-    - args keys MUST use valid parameter names for the selected tool signature above.
-    - Do NOT use generic keys like "column" unless that exact parameter exists.
-    - If there is no tool to complete the request, fall back to codegen mode.
-    - IMPORTANT: If the selected tool requires an input column, args MUST include it.
-    - Never output an empty args object for summarize_categorical.
-
-    - For summarize_categorical:
-    - If the user requests one column, use args={"column":"<col>"}
-    - If the user requests multiple categorical columns, use args={"cat_cols":["<col1>","<col2>"]}
-    - Filesystem paths, report directories, and session folders are handled by the runtime.
-    
-    Examples:
-    User: "frequency table for "cat_col""
-    {"mode":"tool","tool":"summarize_categorical","args":{"column":"cat_col"},"note":"Frequency table is a categorical summary."}
-    
-    User: "frequency tables for "cat_col" and "cat_col""
-    {"mode":"tool","tool":"summarize_categorical","args":{"cat_cols":["cat_col","cat_col"]},"note":"Summarize multiple categorical columns."}
-    
-    User: "show missingness"
-    {"mode":"tool","tool":"missingness_table","args":{},"note":"Missingness summary is available as a tool."}
-    
-    User: "histograms for numeric columns"
-    {"mode":"tool","tool":"plot_histograms","args":{"numeric_cols":["numeric_col","numeric_col"]},"note":"Histogram tool visualizes numeric distributions."}
-
-    FINAL OUTPUT REQUIREMENTS:
-    - Output MUST be valid JSON.
-    - Do NOT include markdown, backticks, or explanations.
-    - Do NOT include any text before or after the JSON.
-    - The response must be parseable by json.loads().
-    """)
+        - Use ONLY columns in the schema.
+        - args keys MUST use valid parameter names for the selected tool signature above.
+        - Do NOT use generic keys like 'column' unless that exact parameter exists.
+        - If there is no tool to complete the request, fall back to codegen mode.
+        - IMPORTANT: If the selected tool requires an input column, args MUST include it.
+        - Never output an empty args object for summarize_categorical.
+        - For summarize_categorical:
+          - If the user requests one column, use args {{"column":"<col>"}}
+          - If the user requests multiple columns, use args {{"cat_cols":["<col1>","<col2>"]}}
+        - For pearson_correlation (2-variable correlation):
+          - Use args {{"x":"<col1>","y":"<col2>"}} NOT column1/column2
+        - For temporal line charts: include temporal_column and numeric_column parameters
+        - Filesystem paths, report directories, and session folders are handled by the runtime.
+        
+        """).format(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessage(content=build_toolplan_system_text),
+            ("system", system_text),
             (
                 "human",
                 "Dataset schema:\n{schema_text}\n\nUser request:\n{user_request}\n",
@@ -798,95 +810,146 @@ def build_toolplan_chain(
     return prompt | llm | StrOutputParser()
 
 
-# NEW Langfuse prompt management function for building the router system text as a fallback
-# if Langfuse prompt management fails or isn't used.
-# This is the same text as the prompt managed in Langfuse, but with dynamic variables
-# for the allowed tools and their argument hints.
-def build_router_system_text_fallback(
-    *,
+def build_router_chain(
+    model: str,
     allowed_tools: list[str],
     tool_descriptions: Dict[str, str],
     tool_arg_hints: str,
-) -> str:
-    allow_str = format_capability_hints(allowed_tools, tool_descriptions)
-
-    router_system_text = dedent("""
-    You are a TOOL ROUTER for a data analysis CLI.
-
-    You see:
-    - Dataset schema (columns + dtypes)
-    - Allow-list tools + tool signatures
-    - User request
-
-    Allow-list tools:
-    {{allowed_tools_text}}
-
-    Tool argument names by signature:
-    {{tool_arg_hints}}
-
-    Your job:
-    1. Decide whether an allow-listed tool can directly satisfy the user request.
-    2. If yes, return a tool decision.
-    3. If no, return a codegen decision.
-
-    Rules:
-    - Use only tool names from the allow-list.
-    - Use only parameter names from the tool signature hints.
-    - Include all required arguments.
-    - Do not invent column names; only use columns that exist in the schema.
-    - The router should include only analysis parameters in args.
-    - Do not include filesystem paths, report directories, or session folders.
-    - Do not include explanations, reasoning, prose, bullet points, or markdown fences.
-    - Do not show your checklist or intermediate reasoning.
-    - Return exactly one JSON object and nothing else.
-
-    Output schema:
-
-    For tool use:
-    {
-        "mode": "tool",
-        "tool": "<exact_tool_name>",
-        "args": {
-            "<arg_name>": <value>
-        }
-    }
-
-    For code generation:
-    {
-        "mode": "codegen",
-        "plan": "<brief plan>",
-        "codegen_instructions": "<what code should do>"
-    }
-
-    Validation requirements:
-    - The top-level key "mode" is required.
-    - "mode" must be exactly "tool" or "codegen".
-    - If "mode" is "tool", include both "tool" and "args".
-    - If "mode" is "codegen", include both "plan" and "codegen_instructions".
-    - Do not output any keys outside the selected schema unless necessary.
-    - Return only the JSON object.
-    """)
-
-    return router_system_text.replace("{{allowed_tools_text}}", allow_str).replace(
-        "{{tool_arg_hints}}", tool_arg_hints
-    )
-
-
-def build_router_chain(
-    *,
-    system_text: str,
-    model: str,
     temperature: float = 0.0,
     stream: bool = False,
 ):
-    """
-    Build router chain from a precompiled system prompt.
-
-    The system_text can come from:
-      - a Python string (CLI fallback)
-      - a Langfuse-managed prompt (preferred for prompt management)
-    """
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
+    allow_str = format_capability_hints(allowed_tools, tool_descriptions)
+
+    system_text = dedent("""
+    You are a ROUTER for an NFL sports data analysis system.
+    Your job: intelligently dispatch user requests to either built-in analysis tools OR custom code generation.
+
+    You see:
+    - Dataset schema (columns + dtypes) from NFL data sources
+    - Allow-list analysis tools + tool signatures
+    - User request (analyst question about performance, trends, team stats, etc.)
+
+    Allow-list tools:
+    {allow_str}
+
+    Tool argument names by signature:
+    {tool_arg_hints}
+
+    Routing checklist (do this before producing JSON):
+    1) Does a tool in the allow-list clearly satisfy the request?
+       - If YES → mode="tool" (fast, deterministic)
+       - If NO  → mode="codegen" (flexible, custom)
+    2) If mode="tool":
+       - pick the exact tool name from the allow-list
+       - extract referenced column names and verify they exist in the schema
+    3) Construct args:
+       - use parameter names from the tool signature hints
+       - include required parameters
+       - do NOT output an empty args object unless the tool truly takes no args
+    
+    The router should only include analysis parameters in args.
+    Filesystem paths, report directories, and session folders are handled by the runtime.
+    
+    Return ONLY valid JSON in exactly ONE of these forms.
+
+    If you choose a tool:
+    ```json
+    {{"mode":"tool","tool":"plot_temporal_line_chart","args":{{"temporal_column":"season","numeric_column":"passing_yards"}},"note":"<brief>"}}
+    ```
+
+    If no tool can satisfy the request:
+    ```json
+    {{"mode":"codegen","code_request":"<concrete coding request>","note":"<brief>"}}
+    ```
+
+    Tool selection guidance (use tool mode when possible):
+    - Dataset overview → basic_profile (explore the football data)
+    - Missing data → missingness_table or plot_missingness (data quality check)
+    - Position/Team breakdowns / frequency tables → summarize_categorical
+    - Stats summaries (yards, points, etc.) → summarize_numeric
+    - Performance correlations between two variables → pearson_correlation (uses x and y params)
+    - Correlation heatmap across many variables → plot_corr_heatmap
+    - Distribution of player/team metrics → plot_histograms
+    - Team counts, position distribution → plot_bar_charts
+    - Stat trends by team/position → plot_cat_num_boxplot
+    - Season/year trends (line chart) → plot_temporal_line_chart
+    - Aggregated season stats → aggregate_by_temporal_column
+    - Regression analysis (e.g., wins vs. passing yards) → multiple_linear_regression
+    - Validate outcome column → target_check
+
+    Tool-specific argument rules:
+    - summarize_categorical requires either:
+      - one column: args={{"column":"<col>"}}
+      - many columns: args={{"cat_cols":["<col1>","<col2>"]}}
+    - pearson_correlation (2-variable correlation) requires:
+      - x: first numeric column name
+      - y: second numeric column name
+      - ci_level (optional): confidence level (default 0.95)
+    - plot_temporal_line_chart requires:
+      - temporal_column: the column to group by (season, year, month, etc.)
+      - numeric_column: the single numeric column to plot
+      - aggregation_method (optional): 'mean' (default), 'sum', 'median', 'min', 'max'
+    - aggregate_by_temporal_column requires:
+      - temporal_column: column to group by
+      - numeric_columns: list of numeric columns to aggregate
+      - aggregation_method (optional): 'mean', 'sum', 'median', 'min', 'max'
+
+    Examples:
+    User: "frequency table for sex"
+    ```json
+    {{"mode":"tool","tool":"summarize_categorical","args":{{"column":"sex"}},"note":"Frequency table is a categorical summary."}}
+    ```
+
+    User: "frequency tables for sex and island"
+    ```json
+    {{"mode":"tool","tool":"summarize_categorical","args":{{"cat_cols":["sex","island"]}},"note":"Summarize multiple categorical columns."}}
+    ```
+
+    User: "show missingness"
+    ```json
+    {{"mode":"tool","tool":"missingness_table","args":{{}},"note":"Missingness summary is available as a tool."}}
+    ```
+    
+    User: "histograms for bill_length_mm and flipper_length_mm"
+    ```json
+    {{
+        "mode":"tool",
+        "tool":"plot_histograms",
+        "args":{{
+            "numeric_cols":["bill_length_mm","flipper_length_mm"]
+        }},
+        "note":"Histogram tool visualizes numeric distributions."
+    }}
+    ```
+
+    User: "correlation between IsInterception and TeamWin"
+    ```json
+    {{
+        "mode":"tool",
+        "tool":"pearson_correlation",
+        "args":{{
+            "x":"IsInterception",
+            "y":"TeamWin"
+        }},
+        "note":"Pearson correlation quantifies relationship between interceptions and team wins."
+    }}
+    ```
+
+    User: "plot average passing yards by season"
+    ```json
+    {{
+        "mode":"tool",
+        "tool":"plot_temporal_line_chart",
+        "args":{{
+            "temporal_column":"season",
+            "numeric_column":"passing_yards",
+            "aggregation_method":"mean"
+        }},
+        "note":"Temporal line chart shows trend of passing yards across seasons."
+    }}
+    ```
+""").format(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -897,6 +960,7 @@ def build_router_chain(
             ),
         ]
     )
+
     return prompt | llm | StrOutputParser()
 
 
@@ -904,20 +968,19 @@ def build_results_summarizer_chain(
     model: str, temperature: float = 0.2, stream: bool = False
 ):
     llm = ChatOpenAI(model=model, temperature=temperature, streaming=stream)
-    results_summarizer_system_text = """
-        You are an expert at explaining data analysis results.
-        Given a user request and tool outputs, do:
-        1) What we ran (1-2 sentences)
-        2) Key results (bullets)
-        3) Interpretation (plain language)
-        4) Caveats/assumptions (bullets)
-        5) Next steps (2-3 suggestions)
-        Do NOT invent results; use only what is provided.
-        """
-
+    system_text = (
+        "You are an expert NFL sports analyst at explaining data analysis findings.\n"
+        "Given a user request and analysis outputs, do:\n"
+        "1) What we analyzed (1-2 sentences): the analysis performed and scope\n"
+        "2) Key findings (bullets): the main stats/insights discovered\n"
+        "3) Sports context (plain language): what this means for teams/players\n"
+        "4) Caveats/limitations (bullets): data gaps, edge cases, assumptions\n"
+        "5) Next questions (2-3 suggestions): follow-up analyses to explore\n"
+        "Do NOT invent results; use only what is provided in the tool output.\n"
+    )
     prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessage(content=results_summarizer_system_text),
+            ("system", system_text),
             ("human", "User request:\n{user_request}\n\nTool output:\n{tool_output}\n"),
         ]
     )
@@ -927,7 +990,7 @@ def build_results_summarizer_chain(
 # --------------------------------------------------------------------------------------
 # Execution (subprocess, not exec)
 # --------------------------------------------------------------------------------------
-@observe(name="execute-generated-script", as_type="span", capture_output=True)
+@observe(name="execute-generated-script", as_type="span", capture_output=False)
 def run_generated_script(
     script_path: Path, data_path: Path, report_dir: Path, timeout_s: int = 60
 ) -> subprocess.CompletedProcess:
@@ -943,21 +1006,29 @@ def run_generated_script(
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
 
 
-HELP_TEXT = """Commands:
+HELP_TEXT = """NFL Sports Data Analysis Agent
+
+Commands:
   help                         Show this help text
-  schema                       Print dataset schema
-  suggest <question>           Build1-style suggestions (LLM)
-  ask <request>                ROUTER decides: tool-run OR codegen (HITL)
-  tool <request>               Force tool-run: choose one Build0 tool + args (HITL)
-  code <request>               Force code generation (HITL) + approve to save
-  run                          Execute last approved script via subprocess (HITL)
+  schema                       Print dataset schema (columns + data types)
+  suggest <question>           Get AI suggestions for analyses (LLM recommendations)
+  ask <request>                ROUTER decides: tool execution OR code generation (HITL)
+  tool <request>               Force tool execution: router selects best tool + args (HITL)
+  code <request>               Force code generation (HITL) + you approve before running
+  run                          Execute last approved/generated script via subprocess (HITL)
   exit                         Quit
 
-Examples:
-  ask run a frequency table for sex
-  ask fit a regression of bill_length_mm on flipper_length_mm and sex
-  tool run a correlation heatmap for numeric columns
-  code create a scatterplot of numeric column by numeric column and save it
+Season/Temporal Trend Examples:
+  ask plot average passing yards by season
+  ask show total sacks over years
+  tool temporal line chart for rushing yards by season
+  code create multi-line chart for passing yards and interceptions by season
+
+Team/Position Analysis Examples:
+  ask frequency table for position
+  ask fit a regression of wins on passing_yards and rushing_yards
+  ask show correlation heatmap for offensive metrics
+  code visualize player statistics distribution by team
 """
 
 
@@ -1017,23 +1088,14 @@ def traced_toolplan(
 @observe(name="build-router", as_type="generation")
 def traced_router(
     router_chain,
-    router_prompt_obj,
     schema_text: str,
     request: str,
     config: Dict[str, Any],
     tags: list[str],
 ) -> str:
     with propagate_attributes(tags=tags + ["build", "router"]):
-        if (
-            LANGFUSE_AVAILABLE
-            and langfuse is not None
-            and router_prompt_obj is not None
-        ):
-            langfuse.update_current_generation(prompt=router_prompt_obj)
-
         return router_chain.invoke(
-            {"schema_text": schema_text, "user_request": request},
-            config=config,
+            {"schema_text": schema_text, "user_request": request}, config=config
         )
 
 
@@ -1049,6 +1111,63 @@ def traced_summarize(
         return summarize_chain.invoke(
             {"user_request": request, "tool_output": tool_output}, config=config
         )
+
+
+def apply_filter(df: pd.DataFrame, filter_spec: Any) -> tuple[pd.DataFrame, str]:
+    """
+    Apply a router-emitted filter dict to a DataFrame before passing it to a tool.
+
+    The router may emit filter conditions like:
+        {"team": "patriots", "season": 2023}
+        {"market": "New England", "year": 2023}
+
+    Matching is case-insensitive for string columns.
+    Returns (filtered_df, human_readable_description).
+    """
+    if not filter_spec or not isinstance(filter_spec, dict):
+        return df, ""
+
+    # Column name aliases the router commonly uses
+    COL_ALIASES: Dict[str, list[str]] = {
+        "team":   ["team", "market", "team_name", "franchise", "club"],
+        "year":   ["year", "season", "yr", "szn"],
+        "player": ["player", "name", "player_name", "athlete"],
+    }
+
+    mask = pd.Series([True] * len(df), index=df.index)
+    applied: list[str] = []
+
+    for filter_key, filter_val in filter_spec.items():
+        # Find the actual column — try the key directly, then aliases
+        candidates = [filter_key] + COL_ALIASES.get(filter_key, [])
+        col = next((c for c in candidates if c in df.columns), None)
+
+        if col is None:
+            print(f"  [filter] WARNING: no column found for filter key '{filter_key}' "
+                  f"(tried: {candidates}). Skipping.")
+            continue
+
+        if isinstance(filter_val, str):
+            col_str = df[col].astype(str).str.lower()
+            col_mask = col_str.str.contains(filter_val.lower(), na=False)
+        else:
+            col_numeric = pd.to_numeric(df[col], errors="coerce")
+            col_mask = col_numeric == filter_val
+
+        n_match = col_mask.sum()
+        if n_match == 0:
+            print(f"  [filter] WARNING: filter {col}={filter_val!r} matched 0 rows. "
+                  f"Unique values sample: {df[col].dropna().unique()[:8].tolist()}")
+        else:
+            print(f"  [filter] {col}={filter_val!r} → {n_match:,} rows")
+
+        mask &= col_mask
+        applied.append(f"{col}={filter_val!r}")
+
+    filtered = df[mask].copy()
+    desc = ", ".join(applied) if applied else ""
+    print(f"  [filter] Result: {len(filtered):,} rows after filtering ({desc})")
+    return filtered, desc
 
 
 @observe(name="build-run-tool", as_type="span", capture_output=False)
@@ -1102,6 +1221,27 @@ def traced_run_tool(
     for k in list(tool_args.keys()):
         if k in dir_defaults and isinstance(tool_args[k], str):
             tool_args[k] = Path(tool_args[k])
+
+    # --- Extract and apply filter BEFORE passing args to tool ---
+    filter_spec = tool_args.pop("filter", None) or tool_args.pop("filters", None)
+    if filter_spec:
+        print("\n  [filter] Applying router filter:", filter_spec)
+        df, filter_desc = apply_filter(df, filter_spec)
+        if df.empty:
+            return ToolResult(
+                name=tool_name,
+                artifact_paths=[],
+                text=f"No rows remain after applying filter {filter_spec}. "
+                     "Check column names and values (string matching is case-insensitive).",
+            )
+
+    # --- Strip args the tool doesn't accept (prevents unexpected-kwarg crashes) ---
+    if not accepts_kwargs:
+        unsupported = [k for k in list(tool_args.keys()) if k not in params]
+        if unsupported:
+            print(f"  [args] Dropping unsupported args not in tool signature: {unsupported}")
+            for k in unsupported:
+                tool_args.pop(k)
 
     # --- Trace + execute ---
     with propagate_attributes(
@@ -1218,14 +1358,7 @@ def do_tool_run_from_plan(
         return
 
     out_txt = report_dir / "tool_outputs" / f"{tool_name}_output.txt"
-
     save_text(out_txt, res.text)
-    if res.artifact_paths:
-        print("Artifacts:")
-        for p in res.artifact_paths:
-            print(f"- {p}")
-            print()
-
     print(f"\nSaved tool output to: {out_txt}\n")
 
     summary = traced_summarize(summarize_chain, req, res.text, base_config, tags)
@@ -1243,22 +1376,20 @@ def do_codegen(
     tags: list[str],
     script_path: Path,
     state: Dict[str, Any],
-    rag_index: Optional[RagIndex] = None,
-    rag_k: int = 4,
+    rag_index=None,
 ) -> None:
-    codegen_request, rag_context = prepare_codegen_request_with_rag(
-        req=req,
-        schema_text=schema_text,
-        rag_index=rag_index,
-        rag_k=rag_k,
-    )
+    # ---- RAG already handled at router level ----
+    augmented_req = req
+    rag_context = None
 
-    if rag_context:
-        print("\n=== RAG CONTEXT RETRIEVED FOR CODEGEN ===\n")
-        print(rag_context + "\n")
-
+    # ---- Code generation ----
     out = traced_codegen(
-        codegen_chain, schema_text, codegen_request, base_config, stream, tags
+        codegen_chain,
+        schema_text,
+        augmented_req,
+        base_config,
+        stream,
+        tags,
     )
 
     candidate = extract_python_code(out)
@@ -1270,6 +1401,7 @@ def do_codegen(
         return
 
     _, _, verify = split_sections(out)
+
     print("=== HUMAN VERIFICATION CHECKLIST (from model) ===")
     print((verify + "\n") if verify else "(No VERIFY section found.)\n")
 
@@ -1280,6 +1412,7 @@ def do_codegen(
 
     state["code_approved"] = candidate
     save_text(script_path, candidate)
+
     print(f"\nApproved and saved to: {script_path}\n")
     print("Next: type 'run' to execute, or 'ask <request>' to route another request.\n")
 
@@ -1335,7 +1468,6 @@ def do_router(
     *,
     req: str,
     router_chain,
-    router_prompt_obj,
     codegen_chain,
     summarize_chain,
     tools: Dict[str, ToolFn],
@@ -1348,89 +1480,49 @@ def do_router(
     stream: bool,
     tags: list[str],
     script_path: Path,
-    rag_index: Optional[RagIndex] = None,
-    rag_k: int = 4,
     state: Dict[str, Any],
+    rag_index=None,
 ) -> None:
-    """
-    Router -> (tool-run OR codegen).
 
-    If router selects tool mode but no matching tool exists in TOOLS,
-    fall back to code generation.
-
-    This version is intentionally defensive:
-    - accepts the ideal schema with "mode"
-    - recovers if the LLM forgets "mode" but clearly returned a tool/codegen shape
-    - tolerates either "codegen_instructions" or older "code_request" naming
-    """
-    raw = traced_router(
-        router_chain,
-        router_prompt_obj,
-        schema_text,
+    # ===== RAG FIRST =====
+    augmented_req, rag_context = prepare_codegen_request_with_rag(
         req,
-        base_config,
-        tags,
+        schema_text,
+        rag_index
     )
+
+    rag_signal = ""
+    if rag_context:
+        rag_signal = f"""
+External knowledge available:
+{rag_context[:500]}
+"""
+
+    # ===== ROUTER =====
+    router_input = schema_text + "\n\n" + rag_signal
+
+    raw = traced_router(router_chain, router_input, augmented_req, base_config, tags)
     plan = parse_json_object(raw)
 
     if not plan:
-        print("\nERROR: Router did not return valid JSON. Try again.\n")
-        print("Raw output was:\n", raw, "\n")
+        print("\nERROR: Router did not return valid JSON.\n")
+        print(raw)
         return
 
-    if not isinstance(plan, dict):
-        print("\nERROR: Router returned JSON, but not a JSON object. Try again.\n")
-        print("Raw output was:\n", raw, "\n")
-        return
-
-    # ------------------------------------------------------------
-    # Recover missing mode when the router output shape is obvious
-    # ------------------------------------------------------------
-    mode = str(plan.get("mode") or "").strip().lower()
-
-    if not mode:
-        if "tool" in plan and "args" in plan:
-            mode = "tool"
-            plan["mode"] = "tool"
-        elif "plan" in plan and "codegen_instructions" in plan:
-            mode = "codegen"
-            plan["mode"] = "codegen"
-        elif "code_request" in plan:
-            mode = "codegen"
-            plan["mode"] = "codegen"
-
-    note = str(plan.get("note") or "").strip()
+    mode = (plan.get("mode") or "").strip().lower()
 
     print("\n=== ROUTER DECISION ===")
     print(json.dumps(plan, indent=2))
-    if note:
-        print(f"\nNote: {note}")
     print()
 
-    # ------------------------------------------------------------
-    # TOOL MODE
-    # ------------------------------------------------------------
+    # ===== TOOL PATH =====
     if mode == "tool":
-        router_tool = str(plan.get("tool") or "").strip()
-        router_args = plan.get("args", {})
+        tool_name = str(plan.get("tool") or "").strip()
 
-        if not router_tool:
-            print("\nERROR: Router chose tool mode but did not provide a tool name.\n")
-            print("Raw output was:\n", raw, "\n")
-            return
-
-        if not isinstance(router_args, dict):
-            print("\nERROR: Router chose tool mode but 'args' is not a JSON object.\n")
-            print("Raw output was:\n", raw, "\n")
-            return
-
-        if router_tool not in tools:
-            print(
-                "Router fallback: no matching tool is available in TOOLS. "
-                "Falling back to code generation.\n"
-            )
+        if tool_name not in tools:
+            print("Fallback → codegen\n")
             do_codegen(
-                req=req,
+                req=augmented_req,
                 codegen_chain=codegen_chain,
                 schema_text=schema_text,
                 base_config=base_config,
@@ -1439,12 +1531,11 @@ def do_router(
                 script_path=script_path,
                 state=state,
                 rag_index=rag_index,
-                rag_k=rag_k,
             )
             return
 
         do_tool_run_from_plan(
-            req=req,
+            req=augmented_req,
             plan=plan,
             summarize_chain=summarize_chain,
             tools=tools,
@@ -1454,16 +1545,12 @@ def do_router(
             report_dir=report_dir,
             base_config=base_config,
             tags=tags,
-            title="TOOL PLAN (from router)",
+            title="TOOL PLAN",
         )
-        return
 
-    # ------------------------------------------------------------
-    # CODEGEN MODE
-    # ------------------------------------------------------------
-    if mode == "codegen":
-        code_req = plan.get("codegen_instructions") or plan.get("code_request") or req
-        code_req = str(code_req).strip()
+    # ===== CODEGEN PATH =====
+    elif mode == "codegen":
+        code_req = plan.get("code_request") or augmented_req
 
         do_codegen(
             req=code_req,
@@ -1475,19 +1562,58 @@ def do_router(
             script_path=script_path,
             state=state,
             rag_index=rag_index,
-            rag_k=rag_k,
         )
-        return
 
-    # ------------------------------------------------------------
-    # INVALID MODE
-    # ------------------------------------------------------------
-    print("\nERROR: Router 'mode' must be 'tool' or 'codegen'. Try again.\n")
-    print("Raw output was:\n", raw, "\n")
+    else:
+        print("Invalid router mode")
+
+    # ===== FINAL RAG STATUS PRINT =====
+    print("\n=== RAG STATUS ===")
+    print("Used RAG:", rag_context is not None)
+    print("==================\n")
+
+# --------------------------------------------------------------------------------------
+# Data loading — single file OR directory of CSVs
+# --------------------------------------------------------------------------------------
+
+def load_data_path(data_path: Path, glob: str = "*.csv") -> pd.DataFrame:
+    """
+    Load a DataFrame from either:
+      - a single file  (CSV, Parquet, Excel — whatever read_data supports), or
+      - a directory    (all files matching *glob* are loaded and concatenated).
+
+    When loading a directory a ``_source_file`` column is added with the stem of
+    each filename (e.g. "Stats-2023") so downstream analysis can reference seasons
+    / splits.  Duplicate column names across files are handled by keeping the union
+    of all columns (missing values become NaN).
+    """
+    if data_path.is_file():
+        return read_data(data_path)
+
+    if not data_path.is_dir():
+        raise FileNotFoundError(f"--data path not found: {data_path}")
+
+    csv_files = sorted(data_path.glob(glob))
+    if not csv_files:
+        raise FileNotFoundError(
+            f"No files matching '{glob}' found in directory: {data_path}"
+        )
+
+    print(f"\n=== DIRECTORY MODE: found {len(csv_files)} file(s) ===")
+    frames: list[pd.DataFrame] = []
+    for f in csv_files:
+        print(f"  Loading: {f.name}")
+        part = read_data(f)
+        part["_source_file"] = f.stem   # e.g. "Stats-2023"
+        frames.append(part)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    print(f"  Combined shape: {combined.shape}\n")
+    return combined
 
 
 # --------------------------------------------------------------------------------------
-# Streamlit backend helpers
+# Streamlit-friendly backend helpers
 # --------------------------------------------------------------------------------------
 def initialize_build4_backend(
     *,
@@ -1500,17 +1626,20 @@ def initialize_build4_backend(
     session_id: str = "streamlit-session",
     knowledge_dir: Optional[Path] = None,
     rag_k: int = 4,
-    tags: Optional[list[str]] = None,
-):
+    tags: Optional[list] = None,
+    glob: str = "*.csv",
+) -> Dict[str, Any]:
     """
-    Initialize everything needed for the UI and return a reusable backend state dict.
+    Initialize everything needed for the Streamlit UI and return a reusable backend
+    state dict.  Mirrors the setup block in main() so the UI can call this once and
+    reuse all chains, tools, and config across interactions.
     """
     tags = tags or ["build4", "streamlit"]
 
     ensure_dirs(report_dir)
     ensure_dirs(report_dir / "tool_outputs")
 
-    df = read_data(data_path)
+    df = load_data_path(data_path, glob=glob)
     df_columns = set(df.columns)
     schema_text = profile_to_schema_text(basic_profile(df))
 
@@ -1521,33 +1650,9 @@ def initialize_build4_backend(
 
     rag_index: Optional[RagIndex] = None
     if knowledge_dir is not None:
-        if not knowledge_dir.exists():
+        if not Path(knowledge_dir).exists():
             raise FileNotFoundError(f"knowledge_dir does not exist: {knowledge_dir}")
         rag_index = load_saved_rag_index(knowledge_dir)
-
-    router_prompt_cfg: Dict[str, Any] = {}
-    router_prompt_obj = None
-
-    try:
-        router_system_text, router_prompt_obj, router_prompt_cfg = (
-            compile_router_prompt_from_langfuse(
-                prompt_name="build_router_system",
-                label="dev",
-                allowed_tools=allowed_tools,
-                tool_descriptions=tool_descriptions,
-                tool_arg_hints=tool_arg_hints,
-            )
-        )
-    except Exception:
-        router_system_text = build_router_system_text_fallback(
-            allowed_tools=allowed_tools,
-            tool_descriptions=tool_descriptions,
-            tool_arg_hints=tool_arg_hints,
-        )
-
-    router_defaults = get_prompt_config_defaults(router_prompt_cfg)
-    effective_router_model = model or router_defaults["model"]
-    effective_router_stream = stream or router_defaults["stream"]
 
     suggest_chain = build_suggest_chain(model, temperature, stream, memory)
     codegen_chain = build_codegen_chain(model, temperature, stream, memory)
@@ -1560,10 +1665,12 @@ def initialize_build4_backend(
         stream=stream,
     )
     router_chain = build_router_chain(
-        system_text=router_system_text,
-        model=effective_router_model,
+        model,
+        allowed_tools=allowed_tools,
+        tool_descriptions=tool_descriptions,
+        tool_arg_hints=tool_arg_hints,
         temperature=0.0,
-        stream=effective_router_stream,
+        stream=stream,
     )
     summarize_chain = build_results_summarizer_chain(model, temperature, stream)
 
@@ -1580,7 +1687,6 @@ def initialize_build4_backend(
         "tool_arg_hints": tool_arg_hints,
         "rag_index": rag_index,
         "rag_k": rag_k,
-        "router_prompt_obj": router_prompt_obj,
         "suggest_chain": suggest_chain,
         "codegen_chain": codegen_chain,
         "toolplan_chain": toolplan_chain,
@@ -1598,6 +1704,7 @@ def initialize_build4_backend(
 
 
 def ui_run_suggest(backend: Dict[str, Any], question: str) -> str:
+    """Call the suggest chain and return the suggestion text."""
     return traced_suggest(
         backend["suggest_chain"],
         backend["schema_text"],
@@ -1609,6 +1716,7 @@ def ui_run_suggest(backend: Dict[str, Any], question: str) -> str:
 
 
 def ui_plan_tool(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
+    """Run the tool-planner chain and return both the raw LLM output and parsed plan."""
     raw = traced_toolplan(
         backend["toolplan_chain"],
         backend["schema_text"],
@@ -1625,6 +1733,10 @@ def ui_run_tool_from_plan(
     request: str,
     plan: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Execute a pre-validated tool plan (no input() calls).
+    Returns a result dict with ok/error, tool output text, summary, and artifact paths.
+    """
     tool_name = plan.get("tool")
     tool_args = coerce_tool_args(plan.get("args", {}))
 
@@ -1673,7 +1785,12 @@ def ui_run_tool_from_plan(
 
 
 def ui_run_codegen(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
-    codegen_request, rag_context = prepare_codegen_request_with_rag(
+    """
+    Run the codegen chain (with optional RAG augmentation).
+    Returns raw LLM output, extracted code, plan/verify sections, and RAG context.
+    Does NOT save or execute — call ui_save_generated_code + ui_run_saved_code for that.
+    """
+    augmented_req, rag_context = prepare_codegen_request_with_rag(
         req=request,
         schema_text=backend["schema_text"],
         rag_index=backend["rag_index"],
@@ -1683,7 +1800,7 @@ def ui_run_codegen(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
     out = traced_codegen(
         backend["codegen_chain"],
         backend["schema_text"],
-        codegen_request,
+        augmented_req,
         backend["base_config"],
         backend["stream"],
         backend["tags"],
@@ -1702,11 +1819,16 @@ def ui_run_codegen(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
 
 
 def ui_save_generated_code(backend: Dict[str, Any], code: str) -> str:
+    """Persist generated code to disk and return the saved path as a string."""
     save_text(backend["script_path"], code)
     return str(backend["script_path"])
 
 
 def ui_run_saved_code(backend: Dict[str, Any], timeout_s: int = 60) -> Dict[str, Any]:
+    """
+    Execute the previously saved generated script via subprocess (no input() calls).
+    Returns stdout, stderr, return code, and the path to the run log.
+    """
     if not backend["script_path"].exists():
         return {
             "ok": False,
@@ -1741,63 +1863,32 @@ def ui_run_saved_code(backend: Dict[str, Any], timeout_s: int = 60) -> Dict[str,
     }
 
 
-def prepare_router_request_with_rag(
-    req: str,
-    schema_text: str,
-    rag_index: Optional[RagIndex],
-    rag_k: int = 4,
-) -> tuple[str, Optional[str]]:
-    if rag_index is None:
-        return req, None
-
-    retrieval_query = f"""
-    User request: {req}
-
-    Dataset schema:
-    {schema_text}
-
-    Retrieve guidance about:
-    - which existing tool should be used
-    - when to prefer a tool over code generation
-    - valid mappings from request types to tool names
-    """.strip()
-
-    results = retrieve_chunks(
-        query=retrieval_query,
-        index=rag_index.index,
-        chunks=rag_index.chunks,
-        k=rag_k,
-        embedding_model=rag_index.embedding_model,
-    )
-    rag_context = format_rag_context(results)
-
-    router_request = dedent(f"""
-    Retrieved guidance for routing:
-    {rag_context}
-
-    Original user request:
-    {req}
-
-    Prefer an existing tool whenever one can directly satisfy the request.
-    Use codegen only when no existing tool is appropriate.
-    """).strip()
-
-    return router_request, rag_context
-
-
 def ui_run_router(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
-    router_request, router_rag_context = prepare_router_request_with_rag(
+    """
+    Run the router chain (with optional RAG augmentation) and return the routing
+    decision as a parsed dict — no input() calls, no HITL approval prompts.
+
+    The caller (Streamlit UI) is responsible for showing the plan and asking the
+    user to confirm before calling ui_run_tool_from_plan or ui_run_codegen.
+    """
+    # Reuse the same RAG augmentation used by do_router in the CLI
+    augmented_req, rag_context = prepare_codegen_request_with_rag(
         req=request,
         schema_text=backend["schema_text"],
         rag_index=backend["rag_index"],
         rag_k=backend["rag_k"],
     )
 
+    # Build the same router_input as do_router
+    rag_signal = ""
+    if rag_context:
+        rag_signal = f"\nExternal knowledge available:\n{rag_context[:500]}\n"
+    router_input_schema = backend["schema_text"] + "\n\n" + rag_signal
+
     raw = traced_router(
         backend["router_chain"],
-        backend["router_prompt_obj"],
-        backend["schema_text"],
-        router_request,
+        router_input_schema,
+        augmented_req,
         backend["base_config"],
         backend["tags"],
     )
@@ -1806,14 +1897,12 @@ def ui_run_router(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
     if not isinstance(plan, dict):
         return {"ok": False, "raw": raw, "error": "Router did not return valid JSON."}
 
+    # Normalize mode — handle routers that omit the "mode" key
     mode = str(plan.get("mode") or "").strip().lower()
     if not mode:
         if "tool" in plan and "args" in plan:
             mode = "tool"
             plan["mode"] = "tool"
-        elif "plan" in plan and "codegen_instructions" in plan:
-            mode = "codegen"
-            plan["mode"] = "codegen"
         elif "code_request" in plan:
             mode = "codegen"
             plan["mode"] = "codegen"
@@ -1823,7 +1912,7 @@ def ui_run_router(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
         "raw": raw,
         "plan": plan,
         "mode": mode,
-        "rag_context": router_rag_context,
+        "rag_context": rag_context,
     }
 
 
@@ -1832,9 +1921,26 @@ def ui_run_router(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="build4: HITL + Router + RAG + Langfuse"
+        description="build4: RAG + HITL + Router (Tool Routing + Optional CodeGen/Execute) + Langfuse"
     )
-    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help="Path to a single CSV file OR a directory of CSV files to concatenate.",
+    )
+    parser.add_argument(
+        "--glob",
+        type=str,
+        default="*.csv",
+        help="Glob pattern for matching files when --data is a directory (default: '*.csv').",
+    )
+    parser.add_argument(
+        "--knowledge_dir",
+        type=str,
+        default=None,
+        help="Path to FAISS RAG index directory",
+    )
     parser.add_argument("--report_dir", type=str, default="reports")
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.2)
@@ -1844,22 +1950,22 @@ def main() -> None:
     parser.add_argument("--timeout_s", type=int, default=60)
     parser.add_argument("--session_id", type=str, default="cli-session")
     parser.add_argument(
-        "--knowledge_dir",
-        type=str,
-        default=None,
-        help="Optional path to a knowledge/ folder containing a prebuilt FAISS RAG index and chunk metadata",
-    )
-    parser.add_argument(
-        "--rag_k",
-        type=int,
-        default=4,
-        help="Number of retrieved chunks to inject into codegen",
+        "--tags", type=str, default="build3", help="Comma-separated Langfuse tags"
     )
 
-    parser.add_argument(
-        "--tags", type=str, default="build4", help="Comma-separated Langfuse tags"
-    )
     args = parser.parse_args()
+
+    # ------------------ RAG INDEX LOADING ------------------
+    rag_index = None
+    if args.knowledge_dir:
+        try:
+            rag_index = load_saved_rag_index(args.knowledge_dir)
+        except Exception as e:
+            print(f"WARNING: Failed to load RAG index: {e}")
+            rag_index = None
+
+    print_rag_status(rag_index)
+    # ------------------------------------------------------
 
     tag_list = parse_tags(args.tags)
 
@@ -1868,70 +1974,16 @@ def main() -> None:
     ensure_dirs(report_dir)
     ensure_dirs(report_dir / "tool_outputs")
 
-    # Load data + schema
-    df = read_data(data_path)
+    # Load data
+    df = load_data_path(data_path, glob=args.glob)
     df_columns = set(df.columns)
     schema_text = profile_to_schema_text(basic_profile(df))
 
-    # Load Build0 tools registry
+    # Load tools
     tools = load_tools()
     allowed_tools = sorted(tools.keys())
     tool_descriptions = load_tool_descriptions()
     tool_arg_hints = format_tool_arg_hints(tools, allowed_tools)
-
-    # Optional Build4 RAG index (used on the codegen path only)
-    rag_index: Optional[RagIndex] = None
-    if args.knowledge_dir:
-        knowledge_dir = Path(args.knowledge_dir)
-        if not knowledge_dir.exists():
-            raise FileNotFoundError(f"knowledge_dir does not exist: {knowledge_dir}")
-        print(f"\nLoading saved FAISS RAG index from: {knowledge_dir}")
-        try:
-            rag_index = load_saved_rag_index(knowledge_dir)
-        except FileNotFoundError as e:
-            raise FileNotFoundError(
-                f"{e}\n\nBuild the RAG index first with:\n"
-                f"  python build_rag_index.py --knowledge_dir {knowledge_dir}"
-            ) from e
-        print(
-            f"RAG ready: {len(rag_index.chunks)} chunks loaded using {rag_index.embedding_model}.\n"
-        )
-
-    # ------------------------------------------------------------
-    # NEW: get router prompt text with fallback to built-in string
-    # if Langfuse prompt not found
-    # ------------------------------------------------------------
-    router_prompt_cfg: Dict[str, Any] = {}
-    router_prompt_obj = None
-
-    try:
-        router_system_text, router_prompt_obj, router_prompt_cfg = (
-            compile_router_prompt_from_langfuse(
-                prompt_name="build_router_system",
-                label="dev",
-                allowed_tools=allowed_tools,
-                tool_descriptions=tool_descriptions,
-                tool_arg_hints=tool_arg_hints,
-            )
-        )
-        print("Router prompt: loaded from Langfuse")
-
-    except Exception as e:
-        print(f"Router prompt: Langfuse load failed ({e}); using local fallback.")
-        router_system_text = build_router_system_text_fallback(
-            allowed_tools=allowed_tools,
-            tool_descriptions=tool_descriptions,
-            tool_arg_hints=tool_arg_hints,
-        )
-        router_prompt_obj = None
-
-    # Optional: read defaults from Langfuse config if present
-    router_defaults = get_prompt_config_defaults(router_prompt_cfg)
-
-    # Current CLI behavior:
-    # args.model and args.stream act as runtime overrides
-    effective_router_model = args.model or router_defaults["model"]
-    effective_router_stream = args.stream or router_defaults["stream"]
 
     # Chains
     suggest_chain = build_suggest_chain(
@@ -1949,10 +2001,12 @@ def main() -> None:
         stream=args.stream,
     )
     router_chain = build_router_chain(
-        system_text=router_system_text,
-        model=effective_router_model,
+        args.model,
+        allowed_tools=allowed_tools,
+        tool_descriptions=tool_descriptions,
+        tool_arg_hints=tool_arg_hints,
         temperature=0.0,
-        stream=effective_router_stream,
+        stream=args.stream,
     )
     summarize_chain = build_results_summarizer_chain(
         args.model, args.temperature, args.stream
@@ -1962,18 +2016,9 @@ def main() -> None:
 
     script_path = report_dir / args.out_file
 
-    print("\n=== build4: HITL + Router + RAG + Langfuse ===\n")
+    print("\n=== build3: HITL + Router ===\n")
     print(f"Tags: {tag_list}")
     print(f"Build0 tools loaded: {', '.join(allowed_tools)}\n")
-
-    if rag_index is not None:
-        print(
-            f"RAG: ENABLED ({len(rag_index.chunks)} chunks from {rag_index.knowledge_dir})\n"
-        )
-    else:
-        print(
-            "RAG: disabled (pass --knowledge_dir to enable Build4A retrieval on codegen)\n"
-        )
 
     if LANGFUSE_AVAILABLE:
         print("Langfuse: ENABLED (CallbackHandler + observe decorator)\n")
@@ -2021,7 +2066,6 @@ def main() -> None:
             do_router(
                 req=req,
                 router_chain=router_chain,
-                router_prompt_obj=router_prompt_obj,
                 codegen_chain=codegen_chain,
                 summarize_chain=summarize_chain,
                 tools=tools,
@@ -2036,7 +2080,6 @@ def main() -> None:
                 script_path=script_path,
                 state=state,
                 rag_index=rag_index,
-                rag_k=args.rag_k,
             )
             continue
 
@@ -2073,9 +2116,8 @@ def main() -> None:
                 stream=args.stream,
                 tags=tag_list,
                 script_path=script_path,
-                rag_index=rag_index,
-                rag_k=args.rag_k,
                 state=state,
+                rag_index=rag_index,
             )
             continue
 
@@ -2094,3 +2136,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
