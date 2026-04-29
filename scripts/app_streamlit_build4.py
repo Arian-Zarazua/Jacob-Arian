@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -41,18 +42,17 @@ from builds.build4_rag_router_agent_streamlit import (
     ui_save_generated_code,
 )
 
-st.set_page_config(page_title="Data Analysis Router Agent", layout="wide")
+st.set_page_config(page_title="NFL Data Agent", page_icon="🏈", layout="wide")
 
-st.title("Data Analysis Router Agent")
+st.title("🏈 NFL Data Analysis Agent")
 st.caption(
-    "This a Streamlit interface for a data analysis router agent. "
-    "Use the sidebar to upload a CSV and start the agent, "
-    "then explore the tabs below to interact with it."
+    "Analyze Pro Football Reference / NFL CSV datasets with routing, RAG, tools, "
+    "code generation, and in-app figure previews."
 )
 
 st.info(
-    "To start the agent: upload a CSV in the sidebar, choose your settings, "
-    "and then click **Initialize Agent**."
+    "Load either one CSV, multiple CSVs, or a local folder path containing CSV files. "
+    "Then click **Initialize Agent**."
 )
 # -----------------------------------------------------------------------------
 # Session state: Memory that holds the backend object, last router result, last tool plan,
@@ -64,6 +64,9 @@ if "backend" not in st.session_state:
 
 if "uploaded_data_path" not in st.session_state:
     st.session_state.uploaded_data_path = None
+
+if "loaded_file_count" not in st.session_state:
+    st.session_state.loaded_file_count = 0
 
 if "last_codegen_result" not in st.session_state:
     st.session_state.last_codegen_result = None
@@ -94,7 +97,33 @@ def save_uploaded_csv(uploaded_file) -> Path:
     out_path = tmp_dir / uploaded_file.name
     with open(out_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
+    st.session_state.loaded_file_count = 1
     return out_path
+
+
+def save_uploaded_csv_folder(uploaded_files) -> Path:
+    """Save multiple uploaded CSVs into a temp folder and return that folder path."""
+    tmp_dir = Path(tempfile.gettempdir()) / "build4_streamlit_uploads" / "csv_folder"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    for old in tmp_dir.glob("*.csv"):
+        old.unlink(missing_ok=True)
+    for uploaded_file in uploaded_files:
+        out_path = tmp_dir / Path(uploaded_file.name).name
+        with open(out_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+    st.session_state.loaded_file_count = len(uploaded_files)
+    return tmp_dir
+
+
+def make_report_zip(report_dir: Path) -> Optional[Path]:
+    if not report_dir.exists():
+        return None
+    zip_path = report_dir.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in report_dir.rglob("*"):
+            if p.is_file():
+                zf.write(p, arcname=p.relative_to(report_dir))
+    return zip_path
 
 
 def safe_read_text(path: Path) -> str:
@@ -127,14 +156,14 @@ def render_single_artifact(
     suffix = path.suffix.lower()
 
     try:
-        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".svg"}:
             st.image(str(path), caption=path.name, width="stretch")
 
         elif suffix == ".csv":
             df = pd.read_csv(path)
             st.dataframe(df, width="stretch")
 
-        elif suffix in {".txt", ".log", ".py", ".md", ".json"}:
+        elif suffix in {".txt", ".log", ".py", ".md", ".json", ".html"}:
             text = safe_read_text(path)
 
             if suffix == ".py":
@@ -225,14 +254,11 @@ def render_report_browser(report_dir: Path) -> None:
 st.sidebar.header("Get Started")
 st.sidebar.markdown(
     """
-    1. Upload a CSV dataset  
-    2. Choose model settings  
+    1. Load one CSV, multiple CSVs, or a local CSV folder  
+    2. Choose model/RAG settings  
     3. Click **Initialize Agent**  
-    4. Then use the tabs to interact with the agent
+    4. Use **Ask**, **Tool**, **Code**, or **Reports**
     """
-)
-st.sidebar.caption(
-    "Important: the app will not run analyses until you click **Initialize Agent**."
 )
 
 model = st.sidebar.text_input("Model", value="gpt-4o-mini")
@@ -247,17 +273,47 @@ report_dir_str = st.sidebar.text_input("Report directory", value="reports_stream
 knowledge_dir_str = st.sidebar.text_input(
     "Knowledge folder for RAG (optional)",
     value="",
-    help="Enter the folder path to your RAG knowledge base if you want the agent to use RAG retrieval. Leave blank to skip RAG.",
+    help="Enter the folder path to your RAG knowledge base. Leave blank to skip RAG.",
 )
 rag_k = st.sidebar.number_input("RAG k", min_value=1, max_value=10, value=4, step=1)
+csv_glob = st.sidebar.text_input("CSV glob for folders", value="*.csv")
 
 st.sidebar.divider()
-st.sidebar.subheader("Upload CSV")
-uploaded_file = st.sidebar.file_uploader("Upload a CSV dataset", type=["csv"])
+st.sidebar.subheader("Dataset")
+data_mode = st.sidebar.radio(
+    "How do you want to load data?",
+    ["Upload one CSV", "Upload multiple CSVs", "Use local folder path"],
+    index=1,
+)
 
-if uploaded_file is not None:
-    st.session_state.uploaded_data_path = save_uploaded_csv(uploaded_file)
-    st.sidebar.success(f"Uploaded: {uploaded_file.name}")
+if data_mode == "Upload one CSV":
+    uploaded_file = st.sidebar.file_uploader("Upload a CSV dataset", type=["csv"], key="one_csv")
+    if uploaded_file is not None:
+        st.session_state.uploaded_data_path = save_uploaded_csv(uploaded_file)
+        st.sidebar.success(f"Uploaded: {uploaded_file.name}")
+
+elif data_mode == "Upload multiple CSVs":
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload CSV files",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="many_csvs",
+        help="Use this for a folder's worth of CSVs. Streamlit saves them into one temporary folder.",
+    )
+    if uploaded_files:
+        st.session_state.uploaded_data_path = save_uploaded_csv_folder(uploaded_files)
+        st.sidebar.success(f"Loaded {len(uploaded_files)} CSV files as one dataset folder.")
+
+else:
+    local_folder = st.sidebar.text_input(
+        "Local CSV folder path",
+        value="data/Pro-Football-Reference/Stats",
+        help="Path must exist on the machine running Streamlit.",
+    )
+    if local_folder.strip():
+        st.session_state.uploaded_data_path = Path(local_folder.strip())
+        st.session_state.loaded_file_count = 0
+        st.sidebar.caption(f"Using path: {st.session_state.uploaded_data_path}")
 
 init_clicked = st.sidebar.button("Initialize Agent", width="stretch")
 
@@ -280,6 +336,7 @@ if init_clicked:
                 session_id="streamlit-session",
                 knowledge_dir=knowledge_dir,
                 rag_k=int(rag_k),
+                glob=csv_glob.strip() or "*.csv",
                 tags=["build4", "streamlit"],
             )
             st.session_state.backend = backend
@@ -291,6 +348,8 @@ if init_clicked:
                 "stream": stream,
                 "knowledge_dir": str(knowledge_dir) if knowledge_dir else "",
                 "rag_k": int(rag_k),
+                "glob": csv_glob.strip() or "*.csv",
+                "loaded_file_count": st.session_state.loaded_file_count,
             }
             st.success("Agent initialized successfully.")
         except Exception as e:
@@ -308,6 +367,17 @@ if backend is None:
     st.info("Upload a CSV and click 'Initialize Agent' in the sidebar.")
 else:
     df = backend["df"]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rows", f"{len(df):,}")
+    m2.metric("Columns", f"{df.shape[1]:,}")
+    loaded_count = st.session_state.backend_signature.get("loaded_file_count") or (df["_source_file"].nunique() if "_source_file" in df.columns else 1)
+    m3.metric("CSV files", str(loaded_count))
+    m4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
+
+    if "_source_file" in df.columns:
+        with st.expander("Loaded CSV files"):
+            st.dataframe(df["_source_file"].value_counts().rename_axis("source_file").reset_index(name="rows"), width="stretch")
 
     left, right = st.columns([1, 1])
 
@@ -372,7 +442,7 @@ if backend is not None:
         st.subheader("ask")
         ask_req = st.text_area(
             "Natural-language request for the router",
-            placeholder="Example: Predict body mass from sex and bill length",
+            placeholder="Example: Plot average passing yards by season",
             key="ask_req",
         )
 
@@ -461,7 +531,7 @@ if backend is not None:
         st.subheader("tool")
         tool_req = st.text_area(
             "Force tool mode",
-            placeholder="Example: Create a correlation heatmap for numeric variables",
+            placeholder="Example: Create a correlation heatmap for offensive metrics",
             key="tool_req",
         )
 
@@ -513,7 +583,7 @@ if backend is not None:
         st.subheader("code")
         code_req = st.text_area(
             "Force code generation",
-            placeholder="Example: Create a scatterplot matrix for all numeric columns and save it",
+            placeholder="Example: Create a multi-season trend chart and save the figure",
             key="code_req",
         )
 
@@ -574,9 +644,9 @@ if backend is not None:
                 st.write("**STDERR**")
                 st.text(run_res["stderr"] or "(empty)")
                 render_artifacts(
-                    [run_res["run_log_path"]],
-                    title="Execution Log",
-                    prefix="exec_log",
+                    run_res.get("artifact_paths", [run_res["run_log_path"]]),
+                    title="Execution Artifacts and Figures",
+                    prefix="exec_artifact",
                 )
             else:
                 st.error(run_res["error"])
@@ -586,7 +656,11 @@ if backend is not None:
     # -----------------------------------------------------------------
     with tab_reports:
         st.subheader("Saved reports and artifacts")
-        render_report_browser(Path(backend["report_dir"]))
+        report_dir = Path(backend["report_dir"])
+        zip_path = make_report_zip(report_dir)
+        if zip_path and zip_path.exists():
+            render_download_button(zip_path, prefix="reports_zip", instance_id="all")
+        render_report_browser(report_dir)
 
 else:
     st.info("Click **Initialize Agent** to unlock the command tabs.")
