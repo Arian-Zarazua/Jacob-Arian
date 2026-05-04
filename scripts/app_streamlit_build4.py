@@ -47,12 +47,12 @@ st.set_page_config(page_title="NFL Data Agent", page_icon="🏈", layout="wide")
 st.title("🏈 NFL Data Analysis Agent")
 st.caption(
     "Analyze Pro Football Reference / NFL CSV datasets with routing, RAG, tools, "
-    "code generation, and in-app figure previews."
+    "SQLite-backed code generation, and in-app figure previews."
 )
 
 st.info(
     "Load either one CSV, multiple CSVs, or a local folder path containing CSV files. "
-    "Then click **Initialize Agent**."
+    "Then click **Initialize Agent**. The app will also build a local SQLite database for dynamic SQL analysis."
 )
 # -----------------------------------------------------------------------------
 # Session state: Memory that holds the backend object, last router result, last tool plan,
@@ -228,6 +228,189 @@ def list_report_files(report_dir: Path) -> list[Path]:
     )
 
 
+
+
+def list_figure_files(report_dir: Path) -> list[Path]:
+    """Return image files saved by generated code/tools so Streamlit can display them inline."""
+    if not report_dir.exists():
+        return []
+
+    image_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".svg"}
+    return sorted(
+        [p for p in report_dir.rglob("*") if p.is_file() and p.suffix.lower() in image_suffixes],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def snapshot_report_files(report_dir: Path) -> dict[str, int]:
+    """Capture current report files so one UI action can show only new/changed outputs."""
+    if not report_dir.exists():
+        return {}
+
+    snapshot: dict[str, int] = {}
+    for p in report_dir.rglob("*"):
+        if p.is_file():
+            try:
+                snapshot[str(p.resolve())] = p.stat().st_mtime_ns
+            except OSError:
+                continue
+    return snapshot
+
+
+def list_new_or_modified_artifacts(
+    report_dir: Path,
+    before_snapshot: dict[str, int],
+    include_suffixes: Optional[set[str]] = None,
+) -> list[Path]:
+    """Return only files created or modified after a single button-triggered run."""
+    if not report_dir.exists():
+        return []
+
+    if include_suffixes is None:
+        include_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".csv"}
+
+    changed: list[Path] = []
+    for p in report_dir.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in include_suffixes:
+            continue
+        try:
+            key = str(p.resolve())
+            mtime_ns = p.stat().st_mtime_ns
+        except OSError:
+            continue
+
+        if key not in before_snapshot or before_snapshot[key] != mtime_ns:
+            changed.append(p)
+
+    return sorted(changed, key=lambda x: x.stat().st_mtime, reverse=True)
+
+
+
+
+ARTIFACT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".csv"}
+
+
+def get_artifact_search_roots(backend: dict) -> list[Path]:
+    """Return likely artifact roots, including fallback folders used by older tools."""
+    roots: list[Path] = []
+
+    def add(raw) -> None:
+        if not raw:
+            return
+        p = Path(raw)
+        candidates = [p]
+        if p.name not in {"tool_figures", "tool_outputs"}:
+            candidates.extend([p / "tool_figures", p / "tool_outputs", p / "figures", p / "plots"])
+        for c in candidates:
+            try:
+                key = str(c.resolve())
+            except Exception:
+                key = str(c)
+            if c.exists() and key not in seen:
+                seen.add(key)
+                roots.append(c)
+
+    seen: set[str] = set()
+    add(backend.get("report_dir"))
+
+    # Common fallback paths when older plotting tools save relative to the app CWD.
+    cwd = Path.cwd()
+    for fallback in [
+        cwd / "reports_streamlit",
+        cwd / "reports",
+        cwd / "tool_figures",
+        cwd / "tool_outputs",
+        cwd / "figures",
+        cwd / "plots",
+    ]:
+        add(fallback)
+
+    return roots
+
+
+def snapshot_artifact_files(backend: dict, include_suffixes: Optional[set[str]] = None) -> dict[str, int]:
+    """Snapshot likely artifact files before a run, across multiple possible output roots."""
+    include_suffixes = include_suffixes or ARTIFACT_SUFFIXES
+    snapshot: dict[str, int] = {}
+    for root in get_artifact_search_roots(backend):
+        files = root.rglob("*") if root.is_dir() else [root]
+        for p in files:
+            if not p.is_file() or p.suffix.lower() not in include_suffixes:
+                continue
+            try:
+                snapshot[str(p.resolve())] = p.stat().st_mtime_ns
+            except OSError:
+                continue
+    return snapshot
+
+
+def list_new_or_modified_artifacts_from_snapshot(
+    backend: dict,
+    before_snapshot: dict[str, int],
+    include_suffixes: Optional[set[str]] = None,
+) -> list[Path]:
+    """Find artifacts changed by a tool run, even if the tool saved in a fallback folder."""
+    include_suffixes = include_suffixes or ARTIFACT_SUFFIXES
+    changed: list[Path] = []
+    seen: set[str] = set()
+    for root in get_artifact_search_roots(backend):
+        files = root.rglob("*") if root.is_dir() else [root]
+        for p in files:
+            if not p.is_file() or p.suffix.lower() not in include_suffixes:
+                continue
+            try:
+                key = str(p.resolve())
+                mtime_ns = p.stat().st_mtime_ns
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            if key not in before_snapshot or before_snapshot[key] != mtime_ns:
+                seen.add(key)
+                changed.append(p)
+    return sorted(changed, key=lambda x: x.stat().st_mtime, reverse=True)
+
+
+def merge_tool_display_artifacts(backend: dict, run_res: dict) -> list[Path]:
+    """Combine reported artifacts, per-run discovered artifacts, and existing valid paths."""
+    return merge_unique_paths(
+        run_res.get("session_artifact_paths", []) or [],
+        run_res.get("artifact_paths", []) or [],
+    )
+
+
+def merge_unique_paths(*path_groups) -> list[Path]:
+    """Merge path-like values without duplicates while preserving order."""
+    merged: list[Path] = []
+    seen: set[str] = set()
+    for group in path_groups:
+        for raw in group or []:
+            p = Path(raw)
+            try:
+                key = str(p.resolve())
+            except Exception:
+                key = str(p)
+            if key not in seen:
+                seen.add(key)
+                merged.append(p)
+    return merged
+
+
+def render_figure_gallery(report_dir: Path, prefix: str = "figure") -> None:
+    """Render generated figures directly in the Streamlit UI."""
+    figure_paths = list_figure_files(report_dir)
+
+    if not figure_paths:
+        st.info("No generated figures were found in the report directory yet.")
+        return
+
+    render_artifacts(
+        figure_paths,
+        title="Generated Figures",
+        prefix=prefix,
+    )
+
 def render_report_browser(report_dir: Path) -> None:
     if not report_dir.exists():
         st.info(f"Report directory does not exist yet: {report_dir}")
@@ -248,16 +431,84 @@ def render_report_browser(report_dir: Path) -> None:
     )
 
 
+
+
+def render_sqlite_database_info(backend: dict) -> None:
+    """Render SQLite build metadata and validation checks in one dashboard section."""
+    db_path = backend.get("db_path")
+    sqlite_meta = backend.get("sqlite_meta", {}) or {}
+    validation = backend.get("sqlite_validation", {}) or {}
+
+    if not db_path:
+        st.info("SQLite metadata not available.")
+        return
+
+    db_path = Path(db_path)
+
+    v_ok = bool(validation.get("ok"))
+    exists = bool(validation.get("exists", db_path.exists()))
+    integrity = validation.get("integrity_check", [])
+    fk_issues = validation.get("foreign_key_check", [])
+    row_counts = validation.get("row_counts", {}) or {}
+    schema_objects = validation.get("schema_objects", []) or []
+    create_statements = validation.get("create_statements", {}) or {}
+    sample_rows = validation.get("sample_rows", {}) or {}
+
+    status_label = "Verified" if v_ok else "Needs attention"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("SQLite status", status_label)
+    c2.metric("DB file exists", "Yes" if exists else "No")
+    c3.metric("Tables/views", f"{len(schema_objects):,}")
+    c4.metric("nfl_data rows", f"{row_counts.get('nfl_data', 0):,}" if isinstance(row_counts.get('nfl_data', 0), int) else str(row_counts.get('nfl_data', 'n/a')))
+
+    st.caption(f"Database path: `{db_path}`")
+    if db_path.exists():
+        render_download_button(db_path, prefix="sqlite_db", instance_id="main")
+
+    if validation.get("error"):
+        st.error(validation["error"])
+    elif v_ok:
+        st.success("SQLite integrity check passed, no foreign-key issues were found, and tables are queryable.")
+    else:
+        st.warning("SQLite database was created, but one or more verification checks needs review.")
+
+    with st.expander("Verification checks", expanded=True):
+        check_df = pd.DataFrame(
+            [
+                {
+                    "check": "PRAGMA integrity_check",
+                    "result": str(integrity or "not run"),
+                    "passed": integrity == [("ok",)] or integrity == [["ok"]],
+                },
+                {
+                    "check": "PRAGMA foreign_key_check",
+                    "result": "no issues" if not fk_issues else str(fk_issues),
+                    "passed": not bool(fk_issues),
+                },
+                {
+                    "check": "Table row counts",
+                    "result": f"{len(row_counts)} tables counted",
+                    "passed": bool(row_counts),
+                },
+            ]
+        )
+        st.dataframe(check_df, width="stretch", hide_index=True)
+
+
+    with st.expander("LLM SQL context"):
+        st.text(backend.get("sqlite_schema_text", "SQLite metadata not available."))
+
+
+
+
 # -----------------------------------------------------------------------------
 # Sidebar controls
 # -----------------------------------------------------------------------------
 st.sidebar.header("Get Started")
 st.sidebar.markdown(
     """
-    1. Load one CSV, multiple CSVs, or a local CSV folder  
-    2. Choose model/RAG settings  
-    3. Click **Initialize Agent**  
-    4. Use **Ask**, **Tool**, **Code**, or **Reports**
+    Select agent parameters and input data sets
     """
 )
 
@@ -270,11 +521,54 @@ timeout_s = st.sidebar.number_input(
 )
 
 report_dir_str = st.sidebar.text_input("Report directory", value="reports_streamlit")
-knowledge_dir_str = st.sidebar.text_input(
-    "Knowledge folder for RAG (optional)",
-    value="",
-    help="Enter the folder path to your RAG knowledge base. Leave blank to skip RAG.",
+
+# -----------------------------------------------------------------------------
+# RAG directory dropdown
+# -----------------------------------------------------------------------------
+def get_default_knowledge_root() -> Path:
+    """Return a reasonable default knowledge root without hard-failing on other machines."""
+    project_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        project_root / "knowledge",
+        Path.cwd() / "knowledge",
+        Path(r"C:\Users\arian\Documents\PythonProjects\Jacob & Arian\knowledge"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+knowledge_root = get_default_knowledge_root()
+
+if knowledge_root.exists():
+    rag_options = ["None"] + sorted(
+        [p.name for p in knowledge_root.iterdir() if p.is_dir()]
+    )
+else:
+    rag_options = ["None"]
+    st.sidebar.warning(f"Knowledge folder not found: {knowledge_root}")
+
+selected_rag = st.sidebar.selectbox(
+    "Knowledge folder for RAG",
+    rag_options,
+    index=0,
+    help="Choose which RAG knowledge directory to use.",
 )
+
+knowledge_dir_str = ""
+if selected_rag != "None":
+    knowledge_dir_str = str(knowledge_root / selected_rag)
+
+with st.sidebar.expander("Advanced RAG path override"):
+    manual_knowledge_dir = st.text_input(
+        "Manual knowledge folder path",
+        value="",
+        help="Optional. Overrides the dropdown when provided.",
+    )
+    if manual_knowledge_dir.strip():
+        knowledge_dir_str = manual_knowledge_dir.strip()
+
 rag_k = st.sidebar.number_input("RAG k", min_value=1, max_value=10, value=4, step=1)
 csv_glob = st.sidebar.text_input("CSV glob for folders", value="*.csv")
 
@@ -350,6 +644,7 @@ if init_clicked:
                 "rag_k": int(rag_k),
                 "glob": csv_glob.strip() or "*.csv",
                 "loaded_file_count": st.session_state.loaded_file_count,
+                "db_path": str(backend.get("db_path", "")),
             }
             st.success("Agent initialized successfully.")
         except Exception as e:
@@ -381,26 +676,26 @@ else:
 
     left, right = st.columns([1, 1])
 
-    with left:
-        st.subheader("Schema")
-        st.text(backend["schema_text"])
-
     with right:
         st.subheader("Preview")
         st.dataframe(df.head(20), width="stretch")
 
-    with st.expander("Column details"):
+    with left:
+        st.subheader("Column details")
         schema_df = pd.DataFrame(
-            {
-                "column": list(df.columns),
-                "dtype": [str(df[c].dtype) for c in df.columns],
-                "missing_n": [int(df[c].isna().sum()) for c in df.columns],
-            }
-        )
+                {
+                    "column": list(df.columns),
+                    "dtype": [str(df[c].dtype) for c in df.columns],
+                    "missing_n": [int(df[c].isna().sum()) for c in df.columns],
+                }
+            )
         st.dataframe(
-            schema_df,
-            width="stretch",
-        )
+                schema_df,
+                width="stretch",
+            )
+
+    st.subheader("SQLite database verification")
+    render_sqlite_database_info(backend)
 
     with st.expander("Loaded tools"):
         st.write(backend["allowed_tools"])
@@ -471,12 +766,17 @@ if backend is not None:
 
                 if router_result["mode"] == "tool":
                     if st.button("Approve and run tool", key="approve_router_tool"):
+                        artifact_snapshot = snapshot_artifact_files(backend)
                         with st.spinner("Running tool..."):
                             run_res = ui_run_tool_from_plan(
                                 backend,
                                 ask_req.strip(),
                                 router_result["plan"],
                             )
+                        session_artifacts = list_new_or_modified_artifacts_from_snapshot(
+                            backend, artifact_snapshot
+                        )
+                        run_res["session_artifact_paths"] = [str(p) for p in session_artifacts]
                         st.session_state.last_tool_run_result = run_res
 
                     tool_run_res = st.session_state.last_tool_run_result
@@ -487,9 +787,10 @@ if backend is not None:
                             st.text(tool_run_res["tool_text"])
                             st.write("**Summary**")
                             st.markdown(tool_run_res["summary"])
+                            display_artifacts = merge_tool_display_artifacts(backend, tool_run_res)
                             render_artifacts(
-                                tool_run_res.get("artifact_paths", []),
-                                title="Tool Artifacts",
+                                display_artifacts,
+                                title="Artifacts generated by this tool run",
                                 prefix="ask_artifact",
                             )
                         else:
@@ -556,8 +857,13 @@ if backend is not None:
                 if not plan:
                     st.error("Planner did not return valid JSON.")
                 else:
+                    artifact_snapshot = snapshot_artifact_files(backend)
                     with st.spinner("Running tool..."):
                         run_res = ui_run_tool_from_plan(backend, tool_req.strip(), plan)
+                    session_artifacts = list_new_or_modified_artifacts_from_snapshot(
+                        backend, artifact_snapshot
+                    )
+                    run_res["session_artifact_paths"] = [str(p) for p in session_artifacts]
                     st.session_state.last_tool_run_result = run_res
 
             tool_run_res = st.session_state.last_tool_run_result
@@ -568,9 +874,10 @@ if backend is not None:
                     st.text(tool_run_res["tool_text"])
                     st.write("**Summary**")
                     st.markdown(tool_run_res["summary"])
+                    display_artifacts = merge_tool_display_artifacts(backend, tool_run_res)
                     render_artifacts(
-                        tool_run_res.get("artifact_paths", []),
-                        title="Tool Artifacts",
+                        display_artifacts,
+                        title="Artifacts generated by this tool run",
                         prefix="tool_artifact",
                     )
                 else:
@@ -583,7 +890,7 @@ if backend is not None:
         st.subheader("code")
         code_req = st.text_area(
             "Force code generation",
-            placeholder="Example: Create a multi-season trend chart and save the figure",
+            placeholder="Example: Use SQL to compare average passing yards by season and team, then save a chart",
             key="code_req",
         )
 
@@ -631,8 +938,13 @@ if backend is not None:
         st.write("Execute the last approved and saved generated script.")
 
         if st.button("Run saved code", key="btn_run_saved_code"):
+            report_snapshot = snapshot_report_files(Path(backend["report_dir"]))
             with st.spinner("Executing script..."):
                 run_res = ui_run_saved_code(backend, timeout_s=int(timeout_s))
+            session_artifacts = list_new_or_modified_artifacts(
+                Path(backend["report_dir"]), report_snapshot
+            )
+            run_res["session_artifact_paths"] = [str(p) for p in session_artifacts]
             st.session_state.last_execute_result = run_res
 
         run_res = st.session_state.last_execute_result
@@ -643,10 +955,20 @@ if backend is not None:
                 st.text(run_res["stdout"] or "(empty)")
                 st.write("**STDERR**")
                 st.text(run_res["stderr"] or "(empty)")
+                session_artifacts = run_res.get("session_artifact_paths", []) or []
+                backend_artifacts = run_res.get("artifact_paths", []) or []
+                display_artifacts = merge_unique_paths(session_artifacts, backend_artifacts)
+
                 render_artifacts(
-                    run_res.get("artifact_paths", [run_res["run_log_path"]]),
-                    title="Execution Artifacts and Figures",
+                    display_artifacts,
+                    title="Artifacts generated by this run",
                     prefix="exec_artifact",
+                )
+
+                render_artifacts(
+                    [run_res["run_log_path"]],
+                    title="Execution Log",
+                    prefix="exec_log",
                 )
             else:
                 st.error(run_res["error"])
@@ -660,6 +982,8 @@ if backend is not None:
         zip_path = make_report_zip(report_dir)
         if zip_path and zip_path.exists():
             render_download_button(zip_path, prefix="reports_zip", instance_id="all")
+
+        render_figure_gallery(report_dir, prefix="reports_figure")
         render_report_browser(report_dir)
 
 else:

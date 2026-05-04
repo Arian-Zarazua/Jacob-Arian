@@ -44,6 +44,7 @@ Thumbs.db
 reports/
 reports_streamlit/
 reports_streamlit
+reports_streamlit/run_log.txt
 figures/
 outputs/
 tool_outputs/
@@ -60,6 +61,7 @@ reports_streamlit.zip
 *.egg-info/
 dist/
 build/
+src.zip
 
 # --------------------------------------------------
 # Langfuse

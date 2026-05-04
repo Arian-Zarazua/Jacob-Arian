@@ -44,6 +44,7 @@ import importlib
 import inspect
 import json
 import re
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -675,13 +676,18 @@ def build_codegen_chain(
         "- You ONLY know the dataset schema. Do NOT invent columns.\n"
         "- Produce ONE Python script that can run as a standalone file.\n"
         "- The script MUST:\n"
-        "  (1) use argparse with --data and --report_dir\n"
-        "  (2) load data with the helper below — --data may be a single CSV file OR\n"
-        "      a directory of CSV files; the helper handles both cases automatically.\n"
-        "      Always use this exact helper — never call pd.read_csv(args.data) directly:\n\n"
-        "      def load_data(data_path: str) -> pd.DataFrame:\n"
-        "          import pathlib, pandas as pd\n"
-        "          p = pathlib.Path(data_path)\n"
+        "  (1) use argparse with --data, --report_dir, and optional --db\n"
+        "  (2) prefer SQLite for analysis when --db exists. This lets the app answer\n"
+        "      broader questions dynamically without reloading a narrow CSV subset.\n"
+        "      Use this exact helper pattern:\n\n"
+        "      def load_analysis_data(args, sql=None):\n"
+        "          import os, sqlite3, pathlib, pandas as pd\n"
+        "          db = args.db or os.environ.get('BUILD4_SQLITE_DB_PATH')\n"
+        "          if db and pathlib.Path(db).exists():\n"
+        "              query = sql or 'SELECT * FROM nfl_data'\n"
+        "              with sqlite3.connect(db) as conn:\n"
+        "                  return pd.read_sql_query(query, conn)\n"
+        "          p = pathlib.Path(args.data)\n"
         "          if p.is_file():\n"
         "              return pd.read_csv(p)\n"
         "          files = sorted(p.glob('*.csv'))\n"
@@ -693,10 +699,12 @@ def build_codegen_chain(
         "              part['_source_file'] = f.stem\n"
         "              frames.append(part)\n"
         "          return pd.concat(frames, ignore_index=True, sort=False)\n\n"
-        "  (3) handle missing values explicitly\n"
-        "  (4) If missing data are present, use listwise deletion unless specified otherwise\n"
-        "  (5) save at least ONE artifact into --report_dir\n"
-        "  (6) validate referenced columns exist (exit nonzero if not)\n\n"
+        "  (3) when filtering, grouping, or joining football data, push that logic into\n"
+        "      a SQL query against nfl_data whenever practical.\n"
+        "  (4) handle missing values explicitly\n"
+        "  (5) If missing data are present, use listwise deletion unless specified otherwise\n"
+        "  (6) save at least ONE artifact into --report_dir\n"
+        "  (7) validate referenced columns exist (exit nonzero if not)\n\n"
         "OUTPUT FORMAT (exactly):\n"
         "PLAN:\n"
         "- ...\n\n"
@@ -801,9 +809,12 @@ def build_toolplan_chain(
         
         """).format(allow_str=allow_str, tool_arg_hints=tool_arg_hints)
 
+    # Use SystemMessage so JSON examples in system_text are treated as literal text.
+    # If this is passed as ("system", system_text), LangChain interprets braces
+    # inside examples like {"tool": ...} as prompt variables.
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", system_text),
+            SystemMessage(content=system_text),
             (
                 "human",
                 "Dataset schema:\n{schema_text}\n\nUser request:\n{user_request}\n",
@@ -995,7 +1006,11 @@ def build_results_summarizer_chain(
 # --------------------------------------------------------------------------------------
 @observe(name="execute-generated-script", as_type="span", capture_output=False)
 def run_generated_script(
-    script_path: Path, data_path: Path, report_dir: Path, timeout_s: int = 60
+    script_path: Path,
+    data_path: Path,
+    report_dir: Path,
+    timeout_s: int = 60,
+    db_path: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     with propagate_attributes(tags=["build", "execute"]):
         cmd = [
@@ -1006,7 +1021,27 @@ def run_generated_script(
             "--report_dir",
             str(report_dir),
         ]
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+
+        # Backward-compatible SQLite handoff: new generated scripts can parse --db,
+        # older scripts still receive the database path through the environment.
+        import os
+        env = dict(os.environ)
+        if db_path is not None:
+            env["BUILD4_SQLITE_DB_PATH"] = str(db_path)
+            try:
+                script_text = script_path.read_text(encoding="utf-8", errors="ignore")
+                if "--db" in script_text:
+                    cmd.extend(["--db", str(db_path)])
+            except Exception:
+                pass
+
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=env,
+        )
 
 
 HELP_TEXT = """NFL Sports Data Analysis Agent
@@ -1616,6 +1651,205 @@ def load_data_path(data_path: Path, glob: str = "*.csv") -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------------------
+# SQLite data layer
+# --------------------------------------------------------------------------------------
+def _safe_sql_identifier(name: str, fallback: str = "table") -> str:
+    """Convert file/column names into SQLite-safe identifiers."""
+    cleaned = re.sub(r"\W+", "_", str(name).strip()).strip("_").lower()
+    if not cleaned:
+        cleaned = fallback
+    if cleaned[0].isdigit():
+        cleaned = f"{fallback}_{cleaned}"
+    return cleaned
+
+
+def _dedupe_sql_columns(columns: list[str]) -> list[str]:
+    """Make DataFrame column names SQLite-safe and unique."""
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for col in columns:
+        base = _safe_sql_identifier(col, fallback="col")
+        n = seen.get(base, 0)
+        seen[base] = n + 1
+        out.append(base if n == 0 else f"{base}_{n + 1}")
+    return out
+
+
+def build_sqlite_database(
+    data_path: Path,
+    db_path: Path,
+    glob: str = "*.csv",
+    combined_table: str = "nfl_data",
+) -> dict[str, Any]:
+    """
+    Build a local SQLite database from the same CSV input used by the agent.
+
+    Tables created:
+      - nfl_data: combined table used by generated analyses
+      - one table per source CSV when data_path is a directory
+
+    Returns metadata used by schema prompts and the Streamlit UI.
+    """
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+
+    source_files = [data_path] if data_path.is_file() else sorted(Path(data_path).glob(glob))
+    if not source_files:
+        raise FileNotFoundError(f"No CSV files found for SQLite build at {data_path}")
+
+    table_map: dict[str, str] = {}
+    table_summaries: list[dict[str, Any]] = []
+    combined_frames: list[pd.DataFrame] = []
+
+    with sqlite3.connect(db_path) as conn:
+        for i, csv_path in enumerate(source_files, start=1):
+            raw = read_data(csv_path)
+            part = raw.copy()
+            part.columns = _dedupe_sql_columns([str(c) for c in part.columns])
+            part["_source_file"] = Path(csv_path).stem
+
+            table_name = _safe_sql_identifier(Path(csv_path).stem or f"source_{i}", fallback="source")
+            if table_name in table_map.values():
+                table_name = f"{table_name}_{i}"
+
+            part.to_sql(table_name, conn, if_exists="replace", index=False)
+            table_map[Path(csv_path).name] = table_name
+            table_summaries.append(
+                {
+                    "table": table_name,
+                    "source_file": Path(csv_path).name,
+                    "rows": int(len(part)),
+                    "columns": list(part.columns),
+                }
+            )
+            combined_frames.append(part)
+
+        combined = pd.concat(combined_frames, ignore_index=True, sort=False)
+        combined.to_sql(combined_table, conn, if_exists="replace", index=False)
+
+        table_summaries.insert(
+            0,
+            {
+                "table": combined_table,
+                "source_file": "combined CSV input",
+                "rows": int(len(combined)),
+                "columns": list(combined.columns),
+            },
+        )
+
+    return {
+        "db_path": str(db_path),
+        "combined_table": combined_table,
+        "table_map": table_map,
+        "tables": table_summaries,
+    }
+
+
+
+
+def verify_sqlite_database(db_path: str | Path, sample_limit: int = 5) -> dict[str, Any]:
+    """
+    Run lightweight SQLite verification checks for the Streamlit dashboard.
+
+    Mirrors the standalone verify_sql.py workflow:
+      - PRAGMA integrity_check
+      - PRAGMA foreign_key_check
+      - schema object listing
+      - CREATE TABLE SQL
+      - row counts
+      - sample rows
+    """
+    db_path = Path(db_path)
+    result: dict[str, Any] = {
+        "db_path": str(db_path),
+        "exists": db_path.exists(),
+        "ok": False,
+        "error": None,
+        "integrity_check": [],
+        "foreign_key_check": [],
+        "schema_objects": [],
+        "create_statements": {},
+        "row_counts": {},
+        "sample_rows": {},
+    }
+
+    if not db_path.exists():
+        result["error"] = f"SQLite database file not found: {db_path}"
+        return result
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            cur.execute("PRAGMA integrity_check;")
+            result["integrity_check"] = [tuple(r) for r in cur.fetchall()]
+
+            cur.execute("PRAGMA foreign_key_check;")
+            result["foreign_key_check"] = [dict(r) for r in cur.fetchall()]
+
+            cur.execute(
+                "SELECT name, type FROM sqlite_master "
+                "WHERE type IN ('table','view') ORDER BY type, name;"
+            )
+            result["schema_objects"] = [dict(r) for r in cur.fetchall()]
+
+            cur.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name;")
+            table_sql = cur.fetchall()
+            result["create_statements"] = {r["name"]: r["sql"] for r in table_sql}
+            tables = [r["name"] for r in table_sql]
+
+            for table in tables:
+                quoted = table.replace('\"', '\"\"')
+                try:
+                    cur.execute(f'SELECT COUNT(*) AS n FROM "{quoted}";')
+                    result["row_counts"][table] = int(cur.fetchone()["n"])
+                except Exception as e:
+                    result["row_counts"][table] = f"ERROR: {e}"
+
+                try:
+                    cur.execute(f'PRAGMA table_info("{quoted}");')
+                    cols = [r["name"] for r in cur.fetchall()]
+                    cur.execute(f'SELECT * FROM "{quoted}" LIMIT ?;', (sample_limit,))
+                    result["sample_rows"][table] = [dict(zip(cols, tuple(row))) for row in cur.fetchall()]
+                except Exception as e:
+                    result["sample_rows"][table] = [{"error": str(e)}]
+
+        integrity_ok = result["integrity_check"] == [("ok",)]
+        fk_ok = len(result["foreign_key_check"]) == 0
+        has_tables = len(result["row_counts"]) > 0
+        result["ok"] = bool(integrity_ok and fk_ok and has_tables)
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+
+def format_sqlite_schema_text(sqlite_meta: dict[str, Any], max_columns: int = 60) -> str:
+    """Format SQLite metadata for LLM prompts and UI display."""
+    if not sqlite_meta:
+        return "SQLite database: not built"
+
+    lines = [
+        "SQLite database available for dynamic analysis:",
+        f"Path: {sqlite_meta['db_path']}",
+        f"Primary combined table: {sqlite_meta.get('combined_table', 'nfl_data')}",
+        "",
+        "Tables:",
+    ]
+    for t in sqlite_meta.get("tables", []):
+        cols = t.get("columns", [])
+        shown = cols[:max_columns]
+        suffix = "" if len(cols) <= max_columns else f" ... (+{len(cols) - max_columns} more)"
+        lines.append(f"- {t.get('table')} ({t.get('rows'):,} rows) from {t.get('source_file')}")
+        lines.append(f"  columns: {', '.join(shown)}{suffix}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------------------
 # Streamlit-friendly backend helpers
 # --------------------------------------------------------------------------------------
 def initialize_build4_backend(
@@ -1644,7 +1878,13 @@ def initialize_build4_backend(
 
     df = load_data_path(data_path, glob=glob)
     df_columns = set(df.columns)
-    schema_text = profile_to_schema_text(basic_profile(df))
+    profile_schema_text = profile_to_schema_text(basic_profile(df))
+
+    db_path = report_dir / "build4_football_analytics.sqlite"
+    sqlite_meta = build_sqlite_database(data_path, db_path, glob=glob)
+    sqlite_validation = verify_sqlite_database(db_path)
+    sqlite_schema_text = format_sqlite_schema_text(sqlite_meta)
+    schema_text = profile_schema_text + "\n\n" + sqlite_schema_text
 
     tools = load_tools()
     allowed_tools = sorted(tools.keys())
@@ -1684,6 +1924,7 @@ def initialize_build4_backend(
         "df": df,
         "df_columns": df_columns,
         "schema_text": schema_text,
+        "profile_schema_text": profile_schema_text,
         "tools": tools,
         "allowed_tools": allowed_tools,
         "tool_descriptions": tool_descriptions,
@@ -1699,6 +1940,10 @@ def initialize_build4_backend(
         "script_path": script_path,
         "report_dir": report_dir,
         "data_path": data_path,
+        "db_path": db_path,
+        "sqlite_meta": sqlite_meta,
+        "sqlite_validation": sqlite_validation,
+        "sqlite_schema_text": sqlite_schema_text,
         "tags": tags,
         "stream": stream,
         "temperature": temperature,
@@ -1800,6 +2045,14 @@ def ui_run_codegen(backend: Dict[str, Any], request: str) -> Dict[str, Any]:
         rag_k=backend["rag_k"],
     )
 
+    sqlite_hint = f"""
+SQLite runtime context:
+- Database path: {backend.get('db_path')}
+- Preferred table: {backend.get('sqlite_meta', {}).get('combined_table', 'nfl_data')}
+- Generated scripts should use --db or BUILD4_SQLITE_DB_PATH when available.
+""".strip()
+    augmented_req = f"{sqlite_hint}\n\n{augmented_req}"
+
     out = traced_codegen(
         backend["codegen_chain"],
         backend["schema_text"],
@@ -1844,6 +2097,7 @@ def ui_run_saved_code(backend: Dict[str, Any], timeout_s: int = 60) -> Dict[str,
             backend["data_path"],
             backend["report_dir"],
             timeout_s=timeout_s,
+            db_path=backend.get("db_path"),
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": f"Script timed out after {timeout_s} seconds."}
@@ -1980,7 +2234,15 @@ def main() -> None:
     # Load data
     df = load_data_path(data_path, glob=args.glob)
     df_columns = set(df.columns)
-    schema_text = profile_to_schema_text(basic_profile(df))
+    profile_schema_text = profile_to_schema_text(basic_profile(df))
+    db_path = report_dir / "build4_football_analytics.sqlite"
+    sqlite_meta = build_sqlite_database(data_path, db_path, glob=args.glob)
+    sqlite_schema_text = format_sqlite_schema_text(sqlite_meta)
+    schema_text = profile_schema_text + "\n\n" + sqlite_schema_text
+    print("\n=== SQLITE DATABASE ===")
+    print(f"Path: {db_path}")
+    print(f"Primary table: {sqlite_meta.get('combined_table', 'nfl_data')}")
+    print("=======================\n")
 
     # Load tools
     tools = load_tools()
