@@ -1,5 +1,5 @@
 === STDOUT ===
-(empty)
+Cleaned data saved to reports_streamlit/cleaned_data.csv
 
 === STDERR ===
 (empty)

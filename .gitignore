@@ -43,10 +43,12 @@ Thumbs.db
 # --------------------------------------------------
 reports/
 reports_streamlit/
+reports_streamlit
 figures/
 outputs/
 tool_outputs/
 tool_figures/
+reports_streamlit.zip
 # --------------------------------------------------
 # Logs
 # --------------------------------------------------

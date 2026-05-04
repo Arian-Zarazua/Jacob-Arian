@@ -1,7 +1,5 @@
 import argparse
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 def load_data(data_path: str) -> pd.DataFrame:
     import pathlib
@@ -19,45 +17,33 @@ def load_data(data_path: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True, sort=False)
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze NFL data.')
-    parser.add_argument('--data', required=True, help='Path to CSV file or directory of CSV files')
-    parser.add_argument('--report_dir', required=True, help='Directory to save reports and visualizations')
+    parser = argparse.ArgumentParser(description='Process NFL data.')
+    parser.add_argument('--data', required=True, help='Path to CSV file or directory containing CSV files.')
+    parser.add_argument('--report_dir', required=True, help='Directory to save the report.')
+
     args = parser.parse_args()
 
-    # Load data
+    # Load the data
     df = load_data(args.data)
 
     # Validate required columns
-    required_columns = ['penalties', 'turnovers', 'time_of_possession', 'total_yds']
+    required_columns = ['season', 'event_date', 'alias', 'rush_att', 'pass_cmp', 'pass_att']
     for col in required_columns:
         if col not in df.columns:
-            print(f"Error: Required column '{col}' is missing from the dataset.")
+            print(f"Error: Required column '{col}' is missing.")
             exit(1)
 
     # Handle missing values with listwise deletion
-    df = df.dropna(subset=required_columns)
+    df = df.dropna()
 
-    # Statistical summaries
-    summary = df[required_columns].describe()
-    summary_path = f"{args.report_dir}/summary_statistics.csv"
-    summary.to_csv(summary_path)
+    # Remove the '_source_file' column
+    if '_source_file' in df.columns:
+        df = df.drop(columns=['_source_file'])
 
-    # Visualizations
-    plt.figure(figsize=(12, 6))
-    sns.scatterplot(data=df, x='penalties', y='time_of_possession', hue='turnovers', palette='viridis', alpha=0.7)
-    plt.title('Penalties vs Time of Possession colored by Turnovers')
-    plt.xlabel('Number of Penalties')
-    plt.ylabel('Time of Possession (in seconds)')
-    plt.savefig(f"{args.report_dir}/penalties_vs_time_of_possession.png")
-    plt.close()
-
-    plt.figure(figsize=(12, 6))
-    sns.boxplot(data=df, x='turnovers', y='total_yds')
-    plt.title('Total Yards by Turnovers')
-    plt.xlabel('Number of Turnovers')
-    plt.ylabel('Total Yards')
-    plt.savefig(f"{args.report_dir}/total_yards_by_turnovers.png")
-    plt.close()
+    # Save the cleaned DataFrame to a new CSV file in the report directory
+    output_file = f"{args.report_dir}/cleaned_data.csv"
+    df.to_csv(output_file, index=False)
+    print(f"Cleaned data saved to {output_file}")
 
 if __name__ == "__main__":
     main()
