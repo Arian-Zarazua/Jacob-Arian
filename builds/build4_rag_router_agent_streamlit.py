@@ -1216,12 +1216,32 @@ def traced_run_tool(
     report_dir: Path,
     tool_args: Dict[str, Any],
     tags: list[str],
+    db_path: Optional[Path] = None,
+    table_name: str = "nfl_data",
 ) -> ToolResult:
     # --- Standard artifact folders (always present) ---
     tool_output_dir = report_dir / "tool_outputs"
     tool_figure_dir = report_dir / "tool_figures"
     tool_output_dir.mkdir(parents=True, exist_ok=True)
     tool_figure_dir.mkdir(parents=True, exist_ok=True)
+
+    def _snapshot_files(base: Path) -> dict[str, int]:
+        if not base.exists():
+            return {}
+        snap: dict[str, int] = {}
+        for fp in base.rglob("*"):
+            if fp.is_file():
+                try:
+                    snap[str(fp.resolve())] = fp.stat().st_mtime_ns
+                except OSError:
+                    pass
+        return snap
+
+    before_snapshot = _snapshot_files(report_dir)
+
+    if db_path is not None:
+        df.attrs["sqlite_db_path"] = str(db_path)
+        df.attrs["sqlite_table_name"] = table_name
 
     # --- Signature inspection (once) ---
     try:
@@ -1254,6 +1274,12 @@ def traced_run_tool(
     for k, default_path in dir_defaults.items():
         if k not in tool_args and (k in params or accepts_kwargs):
             tool_args[k] = default_path
+
+    if db_path is not None:
+        if "db_path" in params or accepts_kwargs:
+            tool_args.setdefault("db_path", db_path)
+        if "table_name" in params or accepts_kwargs:
+            tool_args.setdefault("table_name", table_name)
 
     # Normalize string paths → Path objects (helps if router emitted strings)
     for k in list(tool_args.keys()):
@@ -1303,7 +1329,33 @@ def traced_run_tool(
         print("Figures saved to:", tool_figure_dir)
         print()
 
-        return normalize_tool_return(tool_name, result)
+        normalized = normalize_tool_return(tool_name, result)
+
+        discovered: list[str] = []
+        allowed_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".csv", ".txt", ".json", ".html", ".md"}
+        for fp in report_dir.rglob("*"):
+            if not fp.is_file() or fp.suffix.lower() not in allowed_suffixes:
+                continue
+            try:
+                key = str(fp.resolve())
+                mtime = fp.stat().st_mtime_ns
+            except OSError:
+                continue
+            if key not in before_snapshot or before_snapshot[key] != mtime:
+                discovered.append(str(fp))
+
+        merged: list[str] = []
+        seen: set[str] = set()
+        for raw in list(normalized.artifact_paths or []) + discovered:
+            try:
+                key = str(Path(raw).resolve())
+            except Exception:
+                key = str(raw)
+            if key not in seen:
+                seen.add(key)
+                merged.append(str(raw))
+        normalized.artifact_paths = merged
+        return normalized
 
 
 # --------------------------------------------------------------------------------------
@@ -1883,6 +1935,8 @@ def initialize_build4_backend(
     db_path = report_dir / "build4_football_analytics.sqlite"
     sqlite_meta = build_sqlite_database(data_path, db_path, glob=glob)
     sqlite_validation = verify_sqlite_database(db_path)
+    df.attrs["sqlite_db_path"] = str(db_path)
+    df.attrs["sqlite_table_name"] = sqlite_meta.get("combined_table", "nfl_data")
     sqlite_schema_text = format_sqlite_schema_text(sqlite_meta)
     schema_text = profile_schema_text + "\n\n" + sqlite_schema_text
 
@@ -2006,6 +2060,8 @@ def ui_run_tool_from_plan(
             backend["report_dir"],
             tool_args,
             backend["tags"],
+            db_path=backend.get("db_path"),
+            table_name=backend.get("sqlite_meta", {}).get("combined_table", "nfl_data"),
         )
     except Exception as e:
         return {"ok": False, "error": str(e)}

@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 
 # output formatting helper
 from src.utils.tool_result_utils import ToolResult, make_tool_result
+from src.sql_support import load_columns, dataframe_source_note
 
 
 def plot_missingness(
@@ -49,6 +50,8 @@ def plot_corr_heatmap(
     out_path: Optional[str | Path] = None,
     report_dir: Optional[str | Path] = None,
     missing: str = "drop",
+    db_path: Optional[Union[str, Path]] = None,
+    table_name: str = "nfl_data",
 ) -> ToolResult:
     """
     Create a correlation heatmap for numeric columns.
@@ -98,8 +101,10 @@ def plot_corr_heatmap(
             structured={},
         )
 
-    # Keep only numeric columns requested
-    work_df = df[numeric_cols].copy()
+    # Keep only numeric columns requested; prefer SQLite when available
+    work_df, source = load_columns(df, numeric_cols, db_path=db_path, table_name=table_name)
+    for _c in numeric_cols:
+        work_df[_c] = pd.to_numeric(work_df[_c], errors="coerce")
 
     # Missing-data handling
     if missing == "drop":
@@ -168,7 +173,9 @@ def plot_corr_heatmap(
         structured={
             "numeric_columns": numeric_cols,
             "n_numeric_columns": len(numeric_cols),
+            "source": source,
             "artifact_paths": [str(out_path)],
+            "source": source,
         },
     )
 
@@ -178,6 +185,8 @@ def plot_histograms(
     numeric_cols: List[str],
     fig_dir: Union[str, Path],
     max_cols: int = 12,
+    db_path: Optional[Union[str, Path]] = None,
+    table_name: str = "nfl_data",
 ) -> ToolResult:
     """Save histograms for up to max_cols numeric columns.
 
@@ -189,12 +198,14 @@ def plot_histograms(
     fig_dir = Path(fig_dir)
     fig_dir.mkdir(parents=True, exist_ok=True)
 
+    work_df, source = load_columns(df, numeric_cols[:max_cols], db_path=db_path, table_name=table_name)
     written: List[str] = []
     for c in numeric_cols[:max_cols]:
-        if c not in df.columns:
+        if c not in work_df.columns:
             continue
+        work_df[c] = pd.to_numeric(work_df[c], errors="coerce")
         plt.figure()
-        df[c].dropna().hist(bins=30)
+        work_df[c].dropna().hist(bins=30)
         plt.title(f"Histogram: {c}")
         plt.tight_layout()
         out_path = fig_dir / f"hist_{c}.png"
@@ -210,6 +221,7 @@ def plot_histograms(
             "numeric_columns_requested": numeric_cols,
             "n_histograms_saved": len(written),
             "artifact_paths": written,
+            "source": source,
         },
     )
 
@@ -226,6 +238,8 @@ def plot_bar_charts(
     fig_dir: Optional[Union[str, Path]] = None,
     max_cols: int = 12,
     top_k: int = 20,
+    db_path: Optional[Union[str, Path]] = None,
+    table_name: str = "nfl_data",
 ) -> ToolResult:
     """Save bar charts.
 
@@ -255,18 +269,20 @@ def plot_bar_charts(
         else:
             raise ValueError("Provide one of: 'cat_cols', 'column', or 'x'.")
 
+    load_cols = cat_cols[:max_cols] + ([y] if y is not None and y in df.columns else [])
+    work_df, source = load_columns(df, load_cols, db_path=db_path, table_name=table_name)
     written: List[str] = []
 
     for c in cat_cols[:max_cols]:
-        if c not in df.columns:
+        if c not in work_df.columns:
             raise ValueError(f"Column not found: '{c}'")
 
         plt.figure()
 
-        # 🔥 NEW LOGIC: aggregation vs frequency
-        if y is not None and y in df.columns:
+        if y is not None and y in work_df.columns:
+            work_df[y] = pd.to_numeric(work_df[y], errors="coerce")
             plot_df = (
-                df.groupby(c)[y]
+                work_df.groupby(c)[y]
                 .sum()
                 .sort_values(ascending=False)
                 .head(top_k)
@@ -277,7 +293,7 @@ def plot_bar_charts(
 
         else:
             plot_df = (
-                df[c]
+                work_df[c]
                 .astype("string")
                 .value_counts(dropna=True)
                 .head(top_k)
@@ -304,6 +320,7 @@ def plot_bar_charts(
             "top_k": top_k,
             "n_bar_charts_saved": len(written),
             "artifact_paths": written,
+            "source": source,
         },
     )
 
@@ -316,6 +333,8 @@ def plot_cat_num_boxplot(
     fig_dir: Optional[Union[str, Path]] = None,
     out_dir: Optional[Union[str, Path]] = None,
     missing: str = "drop",
+    db_path: Optional[Union[str, Path]] = None,
+    table_name: str = "nfl_data",
 ) -> ToolResult:
     """Boxplot of a numeric column grouped by a categorical column.
 
@@ -346,7 +365,7 @@ def plot_cat_num_boxplot(
         target_dir.mkdir(parents=True, exist_ok=True)
         out_path = target_dir / f"boxplot_{cat_col}_vs_{num_col}.png"
 
-    sub = df[[cat_col, num_col]].copy()
+    sub, source = load_columns(df, [cat_col, num_col], db_path=db_path, table_name=table_name)
     n_before = len(sub)
 
     if missing == "drop":
