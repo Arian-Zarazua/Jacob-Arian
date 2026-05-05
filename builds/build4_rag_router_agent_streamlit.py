@@ -4,7 +4,7 @@ INTERACTIVE DATA ANALYSIS AGENT
 To interact with the agent, use the following commands:
 
 # With streamlit
-streamlit run .\scripts\app_streamlit_build4.py
+streamlit run .\scripts\app_streamlit_build4_v2.py
 
 # Without RAG
 python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
