@@ -1,143 +1,205 @@
-# Assignment 4: Build 4 – NFL Data Analysis Agent
+# NFL Data Analysis Agent
 
-| | |
-|---|---|
-| **Course** | QAC387 |
-| **Students** | Jacob Poore and Arian Zarazua |
-| ** Build 4 Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log_2.pdf) |
-| ** Build 3 Test Results** | [**View Full Agent Test Log** →](docs/agent_test_log1.pdf) |
+> QAC387 Final Project — Final Release
 
-
-> [!WARNING]
-> **IMPORTANT:** Do NOT commit or upload Langfuse logs.  
-> These files may contain OpenAI API keys and will be blocked by GitHub push protection.
----
-
-
-## Installation
-
-Install dependencies from the root directory:
-```bash
-pip install -r requirements.txt
-```
-
-### Configuration
-
-Set the required API keys:
-```bash
-export OPENAI_API_KEY=your_key
-export LANGFUSE_PUBLIC_KEY=your_key
-export LANGFUSE_SECRET_KEY=your_key
-export LANGFUSE_BASE_URL=http://localhost:3000  # or your port
-```
-
-### Running the Agent
-
-**Using Streamlit WebUI:**
-```bash
- streamlit run .\scripts\app_streamlit_build4.py
-```
-
-**Single file analysis:**
-```bash
-# Without RAG
-python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/ExpectedPoints-2013.csv --report_dir reports --tags build3 --memory
-
-# With RAG
-python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --knowledge_dir knowledge --session_id cli-session --memory
-
-```
-
-**Batch processing (directory of CSVs):**
-```bash
-# Without RAG
-python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --tags build3 --memory
-
-# With RAG
-python builds/build4_rag_router_agent.py --data data/Pro-Football-Reference/Stats --report_dir reports --knowledge_dir knowledge --session_id cli-session --memory
-
-```
-
-
-##  Agent Commands
-
-| Command | Description |
-|---------|-------------|
-| `help` | Show available commands |
-| `schema` | Display dataset schema (columns + data types) |
-| `suggest <question>` | Get AI suggestions for analyses (prioritizes temporal trends) |
-| `ask <request>` | Router decides: tool execution OR code generation (HITL) |
-| `tool <request>` | Force tool execution: router selects best applicable tool |
-| `code <request>` | Force code generation (HITL): review before approving |
-| `run` | Execute last approved/generated script |
-| `exit` | Quit the agent |
+An NFL analytics agent combining LLM routing, SQL-backed analytics, Retrieval-Augmented Generation (RAG), and Human-In-The-Loop (HITL) code execution.
 
 ---
 
-## Example Use Cases
+## Development
 
-**Time Series Analysis:**
-```bash
-ask plot average passing yards by season
-ask show quarterback performance trends across years
+| Name          | GitHub                                            |
+| ------------- | ------------------------------------------------- |
+| Jacob Poore   | [Jacob-Poore](https://github.com/Jacob-Poore)     |
+| Arian Zarazua | [Arian-Zarazua](https://github.com/Arian-Zarazua) |
+
+---
+
+## Deliverables
+
+| Deliverable        | Link                          |
+| ------------------ | ----------------------------- |
+| Final Presentation | `docs/FinalPresentation.pptx` |
+| Final Paper        | `docs/FinalPaper.docx`        |
+
+---
+
+## Core Features
+
+* LLM-based routing between tools and generated Python code
+* SQL-backed analytics using SQLite
+* Retrieval-Augmented Generation (RAG) with FAISS
+* Human-In-The-Loop (HITL) approval workflow
+* Interactive Streamlit dashboard
+* Automated report and visualization generation
+
+---
+
+## Workflow Diagram
+
+![Workflow Diagram](docs/workflow_diagram.png)
+
+---
+
+## Technology Stack
+
+![Technology Stack](docs/stack_diagram.png)
+
+---
+
+## Repository Structure
+
+```text
+builds/        Core agent implementations
+scripts/       Streamlit + RAG utilities
+data/          NFL datasets
+knowledge/     RAG knowledge base
+reports/       Generated reports and plots
+docs/          Final deliverables
 ```
 
 ---
 
-##  Important Cautions & Limitations
+## Included Data Sources
 
-###  Code Generation Risks
-- Generated code may be incorrect or unintended—**always review manually before executing**
-- LLM outputs are probabilistic and can contain logical errors
-- Approve reviewed code before running
-
-###  Tool Limitations
-- Some Build0 tools work best with **single CSV files** (batch mode may use code gen instead)
-- Large datasets may reduce performance (SQL integration planned for v2)
-- Tool arguments are validated against schema, but edge cases may occur
-
-###  Time Series Features
-- Temporal analysis is prioritized when time-based columns detected
-- Aggregation handles NULL values gracefully (drops before aggregation) 
-
-
-##  Architecture
-
-### Intelligent Routing
-The LLM router evaluates user requests and decides between:
-- **Tool Execution** → Dispatches to specialized tools (faster, deterministic)
-- **Code Generation** → Creates custom Python scripts (flexible, custom logic)
-
-### Human-In-The-Loop (HITL)
-- Users review and approve generated code before execution
-- Optional Langfuse logging for activity tracing
-
-### Retrieval-Augmented Generation (RAG)
-- This agent supports Retrieval-Augmented Generation (RAG), which allows it to incorporate external knowledge from a document corpus when generating responses. 
-- RAG is used to improve reasoning in cases where dataset schema alone may be insufficient.
+* Pro Football Reference datasets
+* Stat-Savant play-by-play datasets
+* Multi-season NFL statistical archives
 
 ---
 
-**Building the RAG Index**
+## Build Tools
 
-Before using RAG, build a FAISS index from markdown documents stored in a knowledge directory:
+### Streamlit Interface
+
+Interactive dashboard for prompts, plots, and generated outputs.
+
+```bash
+streamlit run scripts/app_streamlit_build4.py
+```
+
+### RAG Index Builder
+
+Builds the FAISS vector index used for document retrieval.
 
 ```bash
 python -m scripts.build_rag_index
 ```
 
+### Routing Engine
 
+Handles:
 
-##  Known Issues & Future Work
+* Tool selection
+* SQL routing
+* RAG integration
+* HITL code generation
 
-| Issue | Status | Notes |
-|-------|--------|-------|
-| **Tool Misselection** | Mitigated | Enhanced prompts reduce incorrect routing |
-| **Stat-Savant PBP Quality** | Ongoing | Malformed CSV rows; handled by `io_utils.py` |
-| **Temporal Column Naming** | Planned | Standardization needed across datasets |
-| **Code Generation Accuracy** | Ongoing | Requires manual review before execution |
+### SQL Analytics Layer
 
-### Planned Improvements
-- [ ] Enhance tool-specific prompt engineering for improved column routing
-- [ ] SQL integration for large dataset processing
-- [ ] Better date/season field validation
+Included SQLite-backed analysis tools:
+
+* `sql_query`
+* `top_categories`
+* `grouped_numeric_summary`
+* `plot_missingness`
+
+---
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Environment Configuration
+
+```bash
+export OPENAI_API_KEY=your_key
+export LANGFUSE_PUBLIC_KEY=your_key
+export LANGFUSE_SECRET_KEY=your_key
+export LANGFUSE_BASE_URL=http://localhost:3000
+```
+
+---
+
+## Running the Agent
+
+### Streamlit Interface
+
+```bash
+streamlit run scripts/app_streamlit_build4.py
+```
+
+### CLI Usage
+
+```bash
+python builds/build4_rag_router_agent.py \
+  --data data/Pro-Football-Reference/Stats \
+  --report_dir reports \
+  --knowledge_dir knowledge \
+  --session_id cli-session \
+  --memory
+```
+
+---
+
+## Agent Commands
+
+| Command          | Description             |
+| ---------------- | ----------------------- |
+| `help`           | Show available commands |
+| `schema`         | Display dataset schema  |
+| `ask <request>`  | Automatic routing       |
+| `tool <request>` | Force tool execution    |
+| `code <request>` | Force code generation   |
+| `run`            | Execute approved script |
+| `exit`           | Exit the agent          |
+
+---
+
+## Example Requests
+
+```bash
+ask plot average passing yards by season
+tool top 10 teams by scoring offense
+ask generate a trend chart for expected points added
+```
+
+---
+
+## Final Improvements
+
+* Improved routing stability
+* Expanded SQL integration
+* Better report tracking
+* Safer backend tool filtering
+
+---
+
+## Known Limitations
+
+| Area                           | Status                 |
+| ------------------------------ | ---------------------- |
+| Large Dataset Performance      | Ongoing                |
+| Generated Code Reliability     | Manual review required |
+| Temporal Field Standardization | Planned                |
+
+---
+
+## Future Work
+
+* Improved SQL optimization
+* Expanded visualization tooling
+* Additional sports dataset support
+
+---
+
+## Security Notice
+
+> [!WARNING]
+> Never upload or commit Langfuse logs.
+>
+> These files may contain sensitive API credentials and may trigger GitHub push protection.
